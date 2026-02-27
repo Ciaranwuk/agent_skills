@@ -1,1 +1,4 @@
+# Generated verification artifacts and Python bytecode caches.
 artifacts/
+__pycache__/
+*.pyc
