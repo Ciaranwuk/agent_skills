@@ -76,6 +76,7 @@ class TestContractsAndService(unittest.TestCase):
         self.assertEqual(result["fetched_count"], 0)
         self.assertEqual(result["sent_count"], 0)
         self.assertEqual(result["acked_count"], 0)
+        self.assertEqual(result["ack_skipped_count"], 0)
         self.assertEqual(result["error_count"], 0)
 
     def test_process_once_one_inbound_one_outbound(self) -> None:
@@ -91,6 +92,7 @@ class TestContractsAndService(unittest.TestCase):
         self.assertEqual(result["fetched_count"], 1)
         self.assertEqual(result["sent_count"], 1)
         self.assertEqual(result["acked_count"], 1)
+        self.assertEqual(result["ack_skipped_count"], 0)
         self.assertEqual(adapter.sent[0].text, "ack")
         self.assertEqual(adapter.acked, ["1"])
         self.assertEqual(orchestrator.sessions, ["telegram:1001"])
@@ -120,8 +122,59 @@ class TestContractsAndService(unittest.TestCase):
         self.assertEqual(result["fetched_count"], 2)
         self.assertEqual(result["sent_count"], 1)
         self.assertEqual(result["acked_count"], 2)
+        self.assertEqual(result["ack_skipped_count"], 0)
         self.assertEqual(result["error_count"], 1)
         self.assertIn("unsupported output type", result["errors"][0])
+
+    def test_process_once_ack_policy_always_acks_on_send_failure(self) -> None:
+        outbound = OutboundMessage(chat_id="1001", text="reply")
+        adapter = _AdapterStub(updates=[_inbound("1", chat_id="1001")], send_exc=RuntimeError("send down"))
+        orchestrator = _OrchestratorStub(responses={"1": outbound})
+
+        result = process_once(adapter, orchestrator, ack_policy="always")
+
+        self.assertEqual(result["reason"], "completed-with-errors")
+        self.assertEqual(result["sent_count"], 0)
+        self.assertEqual(result["acked_count"], 1)
+        self.assertEqual(result["ack_skipped_count"], 0)
+        self.assertEqual(adapter.acked, ["1"])
+        self.assertEqual(result["error_count"], 1)
+        self.assertIn("RuntimeError: send down", result["errors"][0])
+
+    def test_process_once_ack_policy_on_success_skips_ack_after_send_failure(self) -> None:
+        outbound = OutboundMessage(chat_id="1001", text="reply")
+        adapter = _AdapterStub(updates=[_inbound("1", chat_id="1001")], send_exc=RuntimeError("send down"))
+        orchestrator = _OrchestratorStub(responses={"1": outbound})
+
+        result = process_once(adapter, orchestrator, ack_policy="on-success")
+
+        self.assertEqual(result["reason"], "completed-with-errors")
+        self.assertEqual(result["sent_count"], 0)
+        self.assertEqual(result["acked_count"], 0)
+        self.assertEqual(result["ack_skipped_count"], 1)
+        self.assertEqual(adapter.acked, [])
+        self.assertEqual(result["error_count"], 1)
+        self.assertIn("RuntimeError: send down", result["errors"][0])
+
+    def test_process_once_ack_policy_on_success_acks_non_outbound(self) -> None:
+        adapter = _AdapterStub(updates=[_inbound("1")])
+        orchestrator = _OrchestratorStub(responses={"1": None})
+
+        result = process_once(adapter, orchestrator, ack_policy="on-success")
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["reason"], "processed")
+        self.assertEqual(result["sent_count"], 0)
+        self.assertEqual(result["acked_count"], 1)
+        self.assertEqual(result["ack_skipped_count"], 0)
+        self.assertEqual(adapter.acked, ["1"])
+
+    def test_process_once_invalid_ack_policy_rejected(self) -> None:
+        adapter = _AdapterStub(updates=[_inbound("1")])
+        orchestrator = _OrchestratorStub(responses={"1": None})
+
+        with self.assertRaisesRegex(ValueError, "ack_policy must be 'always' or 'on-success'"):
+            process_once(adapter, orchestrator, ack_policy="unsafe")
 
 
 if __name__ == "__main__":

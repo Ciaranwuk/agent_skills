@@ -5,6 +5,7 @@ from typing import Callable
 
 from .contracts import (
     ChannelAdapterPort,
+    ConfigValidationError,
     ChannelRuntimeError,
     InboundMessage,
     OrchestratorPort,
@@ -22,6 +23,7 @@ class ProcessOnceResult:
     fetched_count: int = 0
     sent_count: int = 0
     acked_count: int = 0
+    ack_skipped_count: int = 0
     error_count: int = 0
     errors: list[str] = field(default_factory=list)
 
@@ -31,6 +33,7 @@ def process_once(
     orchestrator: OrchestratorPort,
     *,
     session_resolver: Callable[[InboundMessage], str] = session_id_for_inbound,
+    ack_policy: str = "always",
 ) -> dict[str, object]:
     """
     Run one deterministic fetch/process/send/ack cycle.
@@ -40,6 +43,8 @@ def process_once(
     - Per-update failures are collected and do not crash the caller.
     - One inbound update can produce at most one outbound message.
     """
+    normalized_ack_policy = _normalize_ack_policy(ack_policy)
+
     try:
         updates = adapter.fetch_updates()
     except Exception as exc:
@@ -58,9 +63,11 @@ def process_once(
 
     sent_count = 0
     acked_count = 0
+    ack_skipped_count = 0
     errors: list[str] = []
 
     for inbound in updates:
+        processed_ok = True
         try:
             session_id = session_resolver(inbound)
             outbound = orchestrator.handle_message(inbound, session_id=session_id)
@@ -74,13 +81,19 @@ def process_once(
                     f"orchestrator returned unsupported output type: {type(outbound).__name__}"
                 )
         except Exception as exc:
+            processed_ok = False
             errors.append(f"update {inbound.update_id}: {_sanitize_exception(exc)}")
-        finally:
-            try:
-                adapter.ack_update(inbound.update_id)
-                acked_count += 1
-            except Exception as exc:
-                errors.append(f"update {inbound.update_id}: ack failed: {_sanitize_exception(exc)}")
+
+        should_ack = normalized_ack_policy == "always" or processed_ok
+        if not should_ack:
+            ack_skipped_count += 1
+            continue
+
+        try:
+            adapter.ack_update(inbound.update_id)
+            acked_count += 1
+        except Exception as exc:
+            errors.append(f"update {inbound.update_id}: ack failed: {_sanitize_exception(exc)}")
 
     reason = "processed" if not errors else "completed-with-errors"
     return asdict(
@@ -90,6 +103,7 @@ def process_once(
             fetched_count=len(updates),
             sent_count=sent_count,
             acked_count=acked_count,
+            ack_skipped_count=ack_skipped_count,
             error_count=len(errors),
             errors=errors,
         )
@@ -100,3 +114,12 @@ def _sanitize_exception(exc: Exception) -> str:
     raw = f"{type(exc).__name__}: {exc}".strip()
     compact = " ".join(raw.split())
     return compact[:500]
+
+
+def _normalize_ack_policy(raw_policy: str) -> str:
+    policy = str(raw_policy).strip().lower()
+    if policy in {"", "always"}:
+        return "always"
+    if policy == "on-success":
+        return "on-success"
+    raise ConfigValidationError("ack_policy must be 'always' or 'on-success'")

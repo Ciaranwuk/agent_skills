@@ -17,6 +17,8 @@ class TelegramApiError(RuntimeError):
     description: str
     status_code: int | None = None
     error_code: int | None = None
+    retry_class: str | None = None
+    retry_after_seconds: float | None = None
 
     def __str__(self) -> str:
         parts = [f"operation={self.operation}", f"kind={self.kind}", f"transient={self.transient}"]
@@ -24,6 +26,10 @@ class TelegramApiError(RuntimeError):
             parts.append(f"status_code={self.status_code}")
         if self.error_code is not None:
             parts.append(f"error_code={self.error_code}")
+        if self.retry_class is not None:
+            parts.append(f"retry_class={self.retry_class}")
+        if self.retry_after_seconds is not None:
+            parts.append(f"retry_after_seconds={self.retry_after_seconds}")
         parts.append(f"description={self.description}")
         return "TelegramApiError(" + ", ".join(parts) + ")"
 
@@ -35,6 +41,8 @@ class TelegramApiError(RuntimeError):
             "description": self.description,
             "status_code": self.status_code,
             "error_code": self.error_code,
+            "retry_class": self.retry_class,
+            "retry_after_seconds": self.retry_after_seconds,
         }
 
 
@@ -126,10 +134,10 @@ class TelegramApiClient:
                 return self._extract_result(operation, parsed)
             except TelegramApiError as exc:
                 last_error = exc
-                should_retry = exc.transient and attempt < self._max_retries
+                should_retry = self._should_retry(exc, attempt=attempt)
                 if not should_retry:
                     raise
-                self._sleeper(self._backoff_for_attempt(attempt))
+                self._sleeper(self._retry_delay_for(exc, attempt=attempt))
 
         if last_error is None:
             raise TelegramApiError(
@@ -161,14 +169,19 @@ class TelegramApiClient:
             parsed = _try_parse_json(raw_body)
             description = _extract_description(parsed) or str(exc.reason or "HTTP error")
             api_error_code = _extract_error_code(parsed)
-            transient = bool(exc.code >= 500 or exc.code == 429)
+            retry_class = _classify_retry_class(status_code=exc.code, error_code=api_error_code)
+            retry_after_seconds = _extract_retry_after(parsed)
+            if retry_after_seconds is None:
+                retry_after_seconds = _extract_retry_after_from_headers(getattr(exc, "headers", None))
             raise TelegramApiError(
                 operation=operation,
                 kind="http-error",
-                transient=transient,
+                transient=retry_class in _RETRYABLE_CLASSES,
                 description=description,
                 status_code=int(exc.code),
                 error_code=api_error_code,
+                retry_class=retry_class,
+                retry_after_seconds=retry_after_seconds,
             ) from exc
         except error.URLError as exc:
             raise TelegramApiError(
@@ -176,6 +189,7 @@ class TelegramApiClient:
                 kind="network-error",
                 transient=True,
                 description=str(exc.reason),
+                retry_class="transient",
             ) from exc
         except TimeoutError as exc:
             raise TelegramApiError(
@@ -183,6 +197,7 @@ class TelegramApiClient:
                 kind="timeout",
                 transient=True,
                 description=str(exc),
+                retry_class="transient",
             ) from exc
         except OSError as exc:
             raise TelegramApiError(
@@ -190,6 +205,7 @@ class TelegramApiClient:
                 kind="network-error",
                 transient=True,
                 description=str(exc),
+                retry_class="transient",
             ) from exc
 
     def _decode_json(self, operation: str, raw_body: bytes) -> Any:
@@ -214,13 +230,15 @@ class TelegramApiClient:
 
         if payload.get("ok") is not True:
             api_error_code = _extract_error_code(payload)
-            transient = bool(api_error_code == 429 or (api_error_code is not None and api_error_code >= 500))
+            retry_class = _classify_retry_class(status_code=None, error_code=api_error_code)
             raise TelegramApiError(
                 operation=operation,
                 kind="api-error",
-                transient=transient,
+                transient=retry_class in _RETRYABLE_CLASSES,
                 description=_extract_description(payload) or "telegram api returned ok=false",
                 error_code=api_error_code,
+                retry_class=retry_class,
+                retry_after_seconds=_extract_retry_after(payload),
             )
 
         return payload.get("result")
@@ -229,6 +247,33 @@ class TelegramApiClient:
         if attempt < len(self._backoff_seconds):
             return self._backoff_seconds[attempt]
         return self._backoff_seconds[-1]
+
+    def _should_retry(self, exc: TelegramApiError, *, attempt: int) -> bool:
+        if attempt >= self._max_retries:
+            return False
+        if exc.retry_class is None:
+            return bool(exc.transient)
+        return exc.retry_class in _RETRYABLE_CLASSES
+
+    def _retry_delay_for(self, exc: TelegramApiError, *, attempt: int) -> float:
+        if exc.retry_class == "rate-limit" and exc.retry_after_seconds is not None:
+            return max(0.0, float(exc.retry_after_seconds))
+        return self._backoff_for_attempt(attempt)
+
+
+_RETRYABLE_CLASSES = {"transient", "rate-limit"}
+
+
+def _classify_retry_class(*, status_code: int | None, error_code: int | None) -> str:
+    resolved_status = int(status_code) if status_code is not None else None
+    resolved_error = int(error_code) if error_code is not None else None
+    if resolved_status == 429 or resolved_error == 429:
+        return "rate-limit"
+    if (resolved_status is not None and resolved_status >= 500) or (
+        resolved_error is not None and resolved_error >= 500
+    ):
+        return "transient"
+    return "non-retryable"
 
 
 def _try_parse_json(raw_body: bytes) -> Any:
@@ -256,3 +301,30 @@ def _extract_error_code(payload: Any) -> int | None:
         except (TypeError, ValueError):
             return None
     return None
+
+
+def _extract_retry_after(payload: Any) -> float | None:
+    if not isinstance(payload, dict):
+        return None
+    parameters = payload.get("parameters")
+    if not isinstance(parameters, dict):
+        return None
+    value = parameters.get("retry_after")
+    return _coerce_non_negative_float(value)
+
+
+def _extract_retry_after_from_headers(headers: Mapping[str, Any] | None) -> float | None:
+    if headers is None:
+        return None
+    value = headers.get("Retry-After")
+    return _coerce_non_negative_float(value)
+
+
+def _coerce_non_negative_float(value: Any) -> float | None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if numeric < 0:
+        return None
+    return numeric
