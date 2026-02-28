@@ -14,6 +14,7 @@ class RuntimeConfig:
     ack_policy: str = "always"
     orchestrator_mode: str = "default"
     codex_timeout_s: float = 20.0
+    notify_on_orchestrator_error: bool = False
     codex_session_max: int = 128
     codex_session_idle_ttl_s: float = 900.0
     poll_interval_s: float = 2.0
@@ -72,6 +73,7 @@ def parse_runtime_config(
         "ack_policy": source_env.get("CHANNEL_ACK_POLICY", "always"),
         "orchestrator_mode": source_env.get("CHANNEL_ORCHESTRATOR_MODE", "default"),
         "codex_timeout_s": source_env.get("CHANNEL_CODEX_TIMEOUT_S", "20.0"),
+        "notify_on_orchestrator_error": source_env.get("CHANNEL_NOTIFY_ON_ORCHESTRATOR_ERROR", "false"),
         "codex_session_max": source_env.get("CHANNEL_CODEX_SESSION_MAX", "128"),
         "codex_session_idle_ttl_s": source_env.get("CHANNEL_CODEX_SESSION_IDLE_TTL_S", "900.0"),
         "poll_interval_s": source_env.get("CHANNEL_POLL_INTERVAL_S", "2.0"),
@@ -85,6 +87,10 @@ def parse_runtime_config(
     _apply_cli_overrides(values, args)
 
     codex_timeout_s = _parse_positive_float(values["codex_timeout_s"], field_name="codex_timeout_s")
+    notify_on_orchestrator_error = _parse_bool(
+        values["notify_on_orchestrator_error"],
+        field_name="notify_on_orchestrator_error",
+    )
     codex_session_max = _parse_positive_int(values["codex_session_max"], field_name="codex_session_max")
     codex_session_idle_ttl_s = _parse_positive_float(
         values["codex_session_idle_ttl_s"],
@@ -103,6 +109,7 @@ def parse_runtime_config(
         ack_policy=str(values["ack_policy"]),
         orchestrator_mode=str(values["orchestrator_mode"]),
         codex_timeout_s=codex_timeout_s,
+        notify_on_orchestrator_error=notify_on_orchestrator_error,
         codex_session_max=codex_session_max,
         codex_session_idle_ttl_s=codex_session_idle_ttl_s,
         poll_interval_s=poll_interval_s,
@@ -129,6 +136,7 @@ def _apply_cli_overrides(values: dict[str, object], args: list[str]) -> None:
             "--ack-policy",
             "--orchestrator-mode",
             "--codex-timeout-s",
+            "--notify-on-orchestrator-error",
             "--codex-session-max",
             "--codex-session-idle-ttl-s",
             "--poll-interval-s",
@@ -150,6 +158,8 @@ def _apply_cli_overrides(values: dict[str, object], args: list[str]) -> None:
                 values["orchestrator_mode"] = value
             elif arg == "--codex-timeout-s":
                 values["codex_timeout_s"] = value
+            elif arg == "--notify-on-orchestrator-error":
+                values["notify_on_orchestrator_error"] = value
             elif arg == "--codex-session-max":
                 values["codex_session_max"] = value
             elif arg == "--codex-session-idle-ttl-s":

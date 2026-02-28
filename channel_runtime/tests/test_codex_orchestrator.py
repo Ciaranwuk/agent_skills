@@ -67,6 +67,25 @@ class TestCodexOrchestrator(unittest.TestCase):
         self.assertTrue(diagnostics[0]["retryable"])
         self.assertIn("RuntimeError: codex unavailable", diagnostics[0]["message"])
 
+    def test_invoke_failure_can_return_minimal_fallback_when_enabled(self) -> None:
+        def _invoke(_: CodexInvocationRequest) -> str | None:
+            raise RuntimeError("codex unavailable")
+
+        orchestrator = CodexOrchestrator(invoke_fn=_invoke, notify_on_error=True)
+        outbound = orchestrator.handle_message(_inbound("1"), session_id="telegram:100")
+
+        self.assertIsNotNone(outbound)
+        assert outbound is not None
+        self.assertEqual(outbound.text, "Sorry, something went wrong. Please try again.")
+        self.assertEqual(outbound.reply_to_message_id, "m-1")
+        self.assertEqual(outbound.metadata["orchestrator_mode"], "codex")
+        self.assertEqual(outbound.metadata["error_code"], "codex-exec-failed")
+        diagnostics = orchestrator.drain_diagnostics()
+        self.assertEqual(len(diagnostics), 1)
+        self.assertEqual(diagnostics[0]["code"], "codex-exec-failed")
+        self.assertTrue(diagnostics[0]["retryable"])
+        self.assertIn("RuntimeError: codex unavailable", diagnostics[0]["message"])
+
     def test_invalid_response_type_records_deterministic_diagnostic(self) -> None:
         orchestrator = CodexOrchestrator(invoke_fn=lambda _: {"text": "bad"})  # type: ignore[return-value]
         outbound = orchestrator.handle_message(_inbound("1"), session_id="telegram:100")
@@ -168,6 +187,24 @@ class TestCodexOrchestrator(unittest.TestCase):
         self.assertEqual(state["timeout_count"], 1)
         self.assertEqual(state["failure_count"], 1)
         self.assertEqual(state["invoke_count"], 0)
+
+    def test_timeout_can_return_timeout_fallback_when_enabled(self) -> None:
+        def _timeout(_: CodexInvocationRequest) -> str | None:
+            raise TimeoutError("deadline exceeded")
+
+        orchestrator = CodexOrchestrator(invoke_fn=_timeout, notify_on_error=True)
+        outbound = orchestrator.handle_message(_inbound("1", chat_id="500"), session_id="telegram:500")
+
+        self.assertIsNotNone(outbound)
+        assert outbound is not None
+        self.assertEqual(outbound.chat_id, "500")
+        self.assertEqual(outbound.text, "Sorry, the request timed out. Please try again.")
+        self.assertEqual(outbound.metadata["error_code"], "codex-timeout")
+        diagnostics = orchestrator.drain_diagnostics()
+        self.assertEqual(len(diagnostics), 1)
+        self.assertEqual(diagnostics[0]["code"], "codex-timeout")
+        self.assertTrue(diagnostics[0]["retryable"])
+        self.assertIn("TimeoutError: deadline exceeded", diagnostics[0]["message"])
 
 
 if __name__ == "__main__":

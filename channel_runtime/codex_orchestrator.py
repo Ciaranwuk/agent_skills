@@ -167,10 +167,12 @@ class CodexOrchestrator:
         self,
         *,
         timeout_s: float = 20.0,
+        notify_on_error: bool = False,
         invoke_fn: Callable[[CodexInvocationRequest], str | None] | None = None,
         session_manager: CodexSessionManager | None = None,
     ) -> None:
         self._timeout_s = float(timeout_s)
+        self._notify_on_error = bool(notify_on_error)
         self._invoke_fn = invoke_fn or (lambda req: _default_codex_invoke(req, timeout_s=self._timeout_s))
         self._session_manager = session_manager or CodexSessionManager()
         self._diagnostics: list[dict[str, Any]] = []
@@ -214,7 +216,9 @@ class CodexOrchestrator:
                     "message": _sanitize_exception(exc),
                 }
             )
-            return None
+            if not self._notify_on_error:
+                return None
+            return _build_error_fallback_message(inbound=inbound, session_id=session_id, code=code)
 
     def drain_diagnostics(self) -> list[dict[str, Any]]:
         diagnostics = list(self._diagnostics)
@@ -269,3 +273,35 @@ def _sanitize_exception(exc: Exception) -> str:
     raw = f"{type(exc).__name__}: {exc}".strip()
     compact = " ".join(raw.split())
     return compact[:500]
+
+
+def _build_error_fallback_message(
+    *,
+    inbound: InboundMessage,
+    session_id: str,
+    code: str,
+) -> OutboundMessage | None:
+    if code not in {
+        "codex-timeout",
+        "codex-exec-failed",
+        "codex-invalid-response",
+        "codex-contract-violation",
+    }:
+        return None
+
+    if code == "codex-timeout":
+        text = "Sorry, the request timed out. Please try again."
+    else:
+        text = "Sorry, something went wrong. Please try again."
+
+    return OutboundMessage(
+        chat_id=inbound.chat_id,
+        text=text,
+        reply_to_message_id=inbound.message_id,
+        metadata={
+            "session_id": session_id,
+            "orchestrator_mode": "codex",
+            "fallback": "orchestrator-error",
+            "error_code": code,
+        },
+    )

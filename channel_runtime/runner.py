@@ -507,6 +507,7 @@ def _resolve_default_orchestrator(
         )
         return CodexOrchestrator(
             timeout_s=config.codex_timeout_s,
+            notify_on_error=config.notify_on_orchestrator_error,
             invoke_fn=codex_invoke,
             session_manager=CodexSessionManager(policy=session_policy),
         )

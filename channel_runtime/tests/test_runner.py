@@ -26,6 +26,7 @@ class TestRuntimeConfig(unittest.TestCase):
             "CHANNEL_ACK_POLICY": "on-success",
             "CHANNEL_ORCHESTRATOR_MODE": "codex",
             "CHANNEL_CODEX_TIMEOUT_S": "9.25",
+            "CHANNEL_NOTIFY_ON_ORCHESTRATOR_ERROR": "true",
             "CHANNEL_CODEX_SESSION_MAX": "64",
             "CHANNEL_CODEX_SESSION_IDLE_TTL_S": "1200",
             "CHANNEL_POLL_INTERVAL_S": "3.5",
@@ -43,6 +44,7 @@ class TestRuntimeConfig(unittest.TestCase):
         self.assertEqual(cfg.ack_policy, "on-success")
         self.assertEqual(cfg.orchestrator_mode, "codex")
         self.assertEqual(cfg.codex_timeout_s, 9.25)
+        self.assertTrue(cfg.notify_on_orchestrator_error)
         self.assertEqual(cfg.codex_session_max, 64)
         self.assertEqual(cfg.codex_session_idle_ttl_s, 1200.0)
         self.assertEqual(cfg.poll_interval_s, 3.5)
@@ -71,6 +73,8 @@ class TestRuntimeConfig(unittest.TestCase):
                 "on-success",
                 "--codex-timeout-s",
                 "4.0",
+                "--notify-on-orchestrator-error",
+                "true",
                 "--codex-session-max",
                 "9",
                 "--codex-session-idle-ttl-s",
@@ -93,6 +97,7 @@ class TestRuntimeConfig(unittest.TestCase):
         self.assertEqual(cfg.ack_policy, "on-success")
         self.assertEqual(cfg.orchestrator_mode, "codex")
         self.assertEqual(cfg.codex_timeout_s, 4.0)
+        self.assertTrue(cfg.notify_on_orchestrator_error)
         self.assertEqual(cfg.codex_session_max, 9)
         self.assertEqual(cfg.codex_session_idle_ttl_s, 22.5)
         self.assertEqual(cfg.allowed_chat_ids, ("44", "55"))
@@ -186,6 +191,10 @@ class TestRuntimeConfig(unittest.TestCase):
     def test_invalid_codex_timeout_rejected(self) -> None:
         with self.assertRaisesRegex(ConfigValidationError, "codex_timeout_s must be a positive number"):
             parse_runtime_config([], env={"CHANNEL_TOKEN": "x", "CHANNEL_CODEX_TIMEOUT_S": "0"})
+
+    def test_invalid_notify_on_orchestrator_error_rejected(self) -> None:
+        with self.assertRaisesRegex(ConfigValidationError, "notify_on_orchestrator_error must be a boolean"):
+            parse_runtime_config([], env={"CHANNEL_TOKEN": "x", "CHANNEL_NOTIFY_ON_ORCHESTRATOR_ERROR": "maybe"})
 
     def test_invalid_codex_session_policy_rejected(self) -> None:
         with self.assertRaisesRegex(ConfigValidationError, "codex_session_max must be an integer >= 1"):
@@ -686,6 +695,39 @@ class TestRuntimeRunnerP2(unittest.TestCase):
         self.assertEqual(detail["context"]["layer"], "orchestrator")
         self.assertEqual(detail["context"]["operation"], "handle_message")
         self.assertEqual(detail["context"]["session_id"], "telegram:42")
+
+    def test_codex_mode_timeout_can_notify_user_when_enabled(self) -> None:
+        adapter = _AdapterStub(updates=[_inbound("1", text="slow", chat_id="42")])
+
+        def _timeout(_: CodexInvocationRequest) -> str | None:
+            raise TimeoutError("codex timed out")
+
+        result = run_cycle(
+            config=RuntimeConfig(
+                token="tkn",
+                orchestrator_mode="codex",
+                notify_on_orchestrator_error=True,
+            ),
+            adapter=adapter,
+            codex_invoke=_timeout,
+            heartbeat_emitter=HeartbeatEventEmitter(enabled=False),
+        )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["reason"], "completed-with-errors")
+        self.assertEqual(result["sent_count"], 1)
+        self.assertEqual(result["acked_count"], 1)
+        self.assertEqual(result["ack_skipped_count"], 0)
+        self.assertEqual(result["error_count"], 1)
+        self.assertEqual(adapter.acked, ["1"])
+        self.assertEqual(len(adapter.sent), 1)
+        self.assertEqual(adapter.sent[0].text, "Sorry, the request timed out. Please try again.")
+        self.assertEqual(adapter.sent[0].metadata["error_code"], "codex-timeout")
+        self.assertIn("TimeoutError: codex timed out", result["errors"][0])
+        self.assertEqual(len(result["error_details"]), 1)
+        detail = result["error_details"][0]
+        self.assertEqual(detail["code"], "codex-timeout")
+        self.assertTrue(detail["retryable"])
 
     def test_on_success_ack_policy_skips_ack_when_send_fails(self) -> None:
         adapter = _AdapterStub(updates=[_inbound("1", text="first")], fail_send_calls={1})
