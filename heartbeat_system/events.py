@@ -6,7 +6,7 @@ import hashlib
 import threading
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Callable, Mapping
+from typing import Any, Callable, Mapping
 
 from .store import (
     DedupeRecord,
@@ -25,6 +25,7 @@ class EventIngestResult:
     should_deliver: bool
     dedupe_suppressed: bool
     dedupe_key: str | None
+    runtime_digest: dict[str, Any] | None = None
 
 
 class HeartbeatEventService:
@@ -50,6 +51,7 @@ class HeartbeatEventService:
             run_reason = str(run_result.get("run_reason", ""))
             output_text = str(run_result.get("output_text", ""))
             error = str(run_result.get("error", ""))
+            runtime_digest = _normalize_runtime_digest(run_result.get("runtime_digest"))
 
             counters = self._store.get_counters()
             if status == "ran":
@@ -117,6 +119,7 @@ class HeartbeatEventService:
                 should_deliver=should_deliver,
                 dedupe_suppressed=dedupe_suppressed,
                 dedupe_key=dedupe_key,
+                runtime_digest=runtime_digest,
             )
 
     def get_last_event(self) -> LastEventRecord | None:
@@ -157,3 +160,27 @@ def _event_id(
 
 def _now_ms() -> int:
     return int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+
+
+def _normalize_runtime_digest(raw: object) -> dict[str, Any] | None:
+    if not isinstance(raw, Mapping):
+        return None
+    return _normalize_mapping(raw)
+
+
+def _normalize_mapping(raw: Mapping[object, object]) -> dict[str, Any]:
+    normalized: dict[str, Any] = {}
+    for key, value in raw.items():
+        key_text = str(key)
+        normalized[key_text] = _normalize_digest_value(value)
+    return normalized
+
+
+def _normalize_digest_value(value: object) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Mapping):
+        return _normalize_mapping(value)
+    if isinstance(value, (list, tuple)):
+        return [_normalize_digest_value(item) for item in value]
+    return str(value)

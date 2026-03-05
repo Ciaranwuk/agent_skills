@@ -151,6 +151,33 @@ class TestHeartbeatEventService(unittest.TestCase):
         self.assertEqual(failed.counters, EventCounters(ran=0, skipped=1, failed=1, deduped=0))
         self.assertEqual(service.get_last_event(), failed.event)
 
+    def test_runtime_digest_is_copied_into_ingest_result(self) -> None:
+        store = _FakeStateStore()
+        clock = _Clock([4_000])
+        service = HeartbeatEventService(
+            store=store,
+            dedupe_window_ms=1_000,
+            now_ms=clock.now_ms,
+        )
+
+        result = service.ingest_run_result(
+            {
+                "status": "failed",
+                "reason": "runtime-process-once-exception",
+                "run_reason": "manual",
+                "error": "RuntimeError: boom",
+                "runtime_digest": {
+                    "context_mode": "durable",
+                    "compaction": {"attempted_total": 1, "failed_total": 1},
+                },
+            }
+        )
+
+        self.assertIsNotNone(result.runtime_digest)
+        self.assertEqual(result.runtime_digest["context_mode"], "durable")
+        self.assertEqual(result.runtime_digest["compaction"]["attempted_total"], 1)
+        self.assertEqual(result.runtime_digest["compaction"]["failed_total"], 1)
+
     def test_concurrent_ingest_preserves_all_counter_increments(self) -> None:
         store = _FakeStateStore()
         now_lock = threading.Lock()
