@@ -1,7 +1,7 @@
 # Telegram Channel Architecture and Flow
 
-Date: 2026-02-28  
-Scope: TG-LIVE behavior through D2/E2
+Date: 2026-03-05  
+Scope: TG-LIVE behavior through D2/E2 and TG-CTX-P3 context management updates
 
 ## 1) What Fits Where
 
@@ -36,6 +36,13 @@ Scope: TG-LIVE behavior through D2/E2
 - `channel_runtime/codex_orchestrator.py`
   - Codex-backed `OrchestratorPort` implementation.
   - Handles session lifecycle and classifies codex failures (`codex-timeout`, `codex-exec-failed`, etc).
+- `channel_runtime/context/` (durable context subsystem in TG-CTX-P3)
+  - `store.py`: JSONL transcript persistence + metadata with strict/non-strict corruption handling.
+  - `assembler.py`: deterministic durable transcript to conversation-history assembly.
+  - `compaction.py`: threshold/manual compaction planning and transcript rewrite path.
+  - `token_estimator.py`: token estimates for assembled windows and telemetry gauges.
+  - `errors.py`: context error taxonomy and mapping to runtime-compatible `error_details`.
+  - `contracts.py` / `types.py`: subsystem ports + context dataclasses + context-store diagnostics.
 
 ### `heartbeat_system` interaction
 - Runtime failure event path uses `heartbeat_system.api.publish_system_event(...)` from `runner.py` default emitter.
@@ -66,6 +73,29 @@ Config source precedence: CLI overrides env; env overrides defaults.
 - Cursor state:
   - `CHANNEL_CURSOR_STATE_PATH` / `--cursor-state-path` (empty disables persistence store)
   - `CHANNEL_STRICT_CURSOR_STATE_IO` / `--strict-cursor-state-io` (boolean)
+- Context subsystem:
+  - `CHANNEL_CONTEXT_MODE` / `--context-mode` (`legacy` default, or `durable`)
+  - `CHANNEL_CONTEXT_WINDOW_TOKENS` / `--context-window-tokens` (default `128000`)
+  - `CHANNEL_CONTEXT_RESERVE_TOKENS` / `--context-reserve-tokens` (default `16000`)
+  - `CHANNEL_CONTEXT_KEEP_RECENT_TOKENS` / `--context-keep-recent-tokens` (default `24000`)
+  - `CHANNEL_CONTEXT_SUMMARY_MAX_TOKENS` / `--context-summary-max-tokens` (default `1200`)
+  - `CHANNEL_CONTEXT_MIN_GAIN_TOKENS` / `--context-min-gain-tokens` (default `800`)
+  - `CHANNEL_CONTEXT_COMPACTION_COOLDOWN_S` / `--context-compaction-cooldown-s` (default `300`)
+  - `CHANNEL_CONTEXT_STRICT_IO` / `--context-strict-io` (default `false`)
+  - `CHANNEL_CONTEXT_MANUAL_COMPACT` / `--context-manual-compact` (default `false`)
+
+Context defaults and current effective behavior:
+- Default mode remains `legacy`; durable store/compaction paths are disabled unless `CHANNEL_CONTEXT_MODE=durable`.
+- `CHANNEL_CONTEXT_STRICT_IO` is effective in durable mode (corruption/load behavior).
+- `CHANNEL_CONTEXT_MANUAL_COMPACT=true` enables `/ctx inspect` and `/ctx compact` interception in codex mode.
+- Current runtime wiring uses fixed compaction policy values (`min_compaction_gain_tokens=0`, `cooldown_window_s=0.0`) when constructing the codex durable orchestrator; parsed values for `CHANNEL_CONTEXT_MIN_GAIN_TOKENS`, `CHANNEL_CONTEXT_COMPACTION_COOLDOWN_S`, and `CHANNEL_CONTEXT_SUMMARY_MAX_TOKENS` are reserved for subsequent policy wiring.
+- Legacy emergency path retention contract (TG-CTX-P4-T03):
+  - `CHANNEL_CONTEXT_MODE=legacy` is the explicit kill-switch for emergency rollback.
+  - Retention window is one release cycle after 2026-03-05.
+  - Legacy mode removal requires all conditions:
+    - durable canary and full rollout complete that release cycle without unresolved stability regressions;
+    - no unresolved sev-1/sev-2 incidents attributable to durable context behavior;
+    - rollback/runbook validation completes without requiring legacy mode.
 
 ## 3) End-to-End Flow (Sequence Style)
 
@@ -106,6 +136,14 @@ Telegram getUpdates
   - Always added as adapter diagnostics.
   - With `strict_cursor_state_io=true`, state load/save failure raises runtime error path.
   - With `false`, cycle continues and surfaces diagnostics only.
+- Context transcript corruption and strict I/O:
+  - `ContextStore.load_transcript(...)` validates each JSONL line.
+  - With `CHANNEL_CONTEXT_STRICT_IO=false` (default), malformed lines are skipped and recorded as context-store diagnostics.
+  - With `CHANNEL_CONTEXT_STRICT_IO=true`, malformed transcript lines raise `context-store-load-error` (non-retryable) and fail the durable path.
+- Manual operator context commands:
+  - Enabled only when all are true: `CHANNEL_ORCHESTRATOR_MODE=codex`, `CHANNEL_CONTEXT_MODE=durable`, `CHANNEL_CONTEXT_MANUAL_COMPACT=true`.
+  - Commands: `/ctx inspect` (`/context inspect`) and `/ctx compact` (`/context compact`).
+  - Report format fields: `session_id`, `status`, `reason`, `tokens_before`, `tokens_after`, `gained_tokens`, `turns_before`, `turns_after`.
 
 ## 4) Payload Surfaces Used by Operators
 
@@ -125,6 +163,20 @@ Telegram getUpdates
 - `telemetry.counters`: `fetch_total`, `send_total`, `drop_total`, `heartbeat_emit_failures` (+ placeholder counters)
 - `telemetry.timers_ms.cycle_total` (+ placeholder `fetch`/`send`)
 - `telemetry.heartbeat.emit_state`: `disabled`, `emitted`, `emit-failed`
+- `telemetry.context.mode`: `legacy` or `durable`
+- `telemetry.context.compaction`:
+  - `attempted_total`, `succeeded_total`, `failed_total`, `fallback_used_total`
+  - `reasons.threshold_total`, `reasons.overflow_total`, `reasons.manual_total`
+- `telemetry.context.tokens`:
+  - `estimated_total`, `build_failures_total`
+  - `current_estimate`, `summary_estimate`, `recent_estimate`
+
+### Runtime digest
+- `runtime_digest.context_mode`
+- `runtime_digest.context_compaction`:
+  - `attempted_total`, `succeeded_total`, `failed_total`, `fallback_used_total`
+- `runtime_digest.context_tokens`:
+  - `estimated_total`, `build_failures_total`, `current_estimate`, `summary_estimate`, `recent_estimate`
 
 ### Heartbeat failure event context (when emitted)
 - `context.heartbeat.emit_state`
@@ -132,8 +184,52 @@ Telegram getUpdates
 - `context.telemetry_digest.send_total`
 - `context.telemetry_digest.drop_total`
 - `context.telemetry_digest.cycle_total_ms`
+- `context.telemetry_digest.context_mode`
+- `context.telemetry_digest.context_compaction_attempted_total`
+- `context.telemetry_digest.context_compaction_succeeded_total`
+- `context.telemetry_digest.context_compaction_failed_total`
+- `context.telemetry_digest.context_compaction_fallback_used_total`
+- `context.telemetry_digest.context_compaction_reason_threshold_total`
+- `context.telemetry_digest.context_compaction_reason_overflow_total`
+- `context.telemetry_digest.context_compaction_reason_manual_total`
+- `context.telemetry_digest.context_tokens_estimated_total`
+- `context.telemetry_digest.context_tokens_build_failures_total`
+- `context.telemetry_digest.context_current_tokens_estimate`
+- `context.telemetry_digest.context_summary_tokens_estimate`
+- `context.telemetry_digest.context_recent_tokens_estimate`
 
-## 5) Where To Debug
+### Context diagnostics taxonomy
+- Context subsystem core codes:
+  - `context-store-load-error` (`operation=store_load`, retryable depends on failure type)
+  - `context-store-save-error` (`operation=store_save`, retryable depends on failure type)
+  - `context-assembler-error` (`operation=assemble`, non-retryable)
+  - `context-estimator-error` (`operation=estimate`, non-retryable)
+  - `context-compaction-error` (`operation=compact`, retryable)
+- Context store non-strict parse diagnostics (line-level skip diagnostics):
+  - `context-store-malformed-line`
+  - `context-store-invalid-record`
+  - `context-store-session-mismatch`
+- Operator control diagnostics:
+  - `context-operator-command-error` when inspect/compact command handling fails.
+
+## 5) Rollback to Legacy Context Mode
+
+Use this rollback whenever durable-context behavior regresses canary/runtime stability:
+
+```bash
+cd /home/cwilson/projects/agent_skills
+export CHANNEL_CONTEXT_MODE="legacy"
+export CHANNEL_CONTEXT_MANUAL_COMPACT="false"
+bash scripts/restart_channel_runtime.sh
+```
+
+Expected rollback effect:
+- Durable context store and compaction paths are bypassed.
+- `/ctx inspect` and `/ctx compact` are not intercepted by orchestrator control path.
+- Payload continues to include `runtime_digest` and `telemetry`; context fields reflect `context_mode=legacy` with zeroed compaction counters.
+- Rollback expectation for operators: keep this kill-switch available for the one-release retention window; invoke immediately on durable regressions and restart runtime with updated env.
+
+## 6) Where To Debug
 
 ### Layer 1: Config and startup errors
 - Files:
@@ -182,7 +278,7 @@ Telegram getUpdates
   - `python3 -m unittest channel_runtime.tests.test_codex_orchestrator`
   - `python3 -m unittest channel_runtime.tests.test_runner`
 
-## 6) Related Operator Docs
+## 7) Related Operator Docs
 
 - Runbook: `TELEGRAM-CHANNEL-OPERATOR-RUNBOOK.md`
 - Live plan: `TELEGRAM-CHANNEL-LIVE-CODEX-COMPLETION-PLAN.md`

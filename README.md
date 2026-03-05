@@ -4,6 +4,8 @@ This repo contains a modular Telegram runtime plus two supporting subsystems:
 - `heartbeat_system`: best-effort runtime/system eventing and heartbeat execution.
 - `memory_system`: local markdown indexing and retrieval (`search` and `get`).
 
+Current default context mode is `legacy` (`CHANNEL_CONTEXT_MODE=legacy`). Durable context mode (`durable`) is available behind explicit runtime config.
+
 ## Repository Map
 
 - `channel_core`: provider-agnostic contracts and single-cycle processing (`process_once`).
@@ -26,6 +28,9 @@ export CHANNEL_ACK_POLICY="always"
 export CHANNEL_POLL_INTERVAL_S="2.0"
 export CHANNEL_ALLOWED_CHAT_IDS=""
 export CHANNEL_LIVE_MODE="false"
+export CHANNEL_CONTEXT_MODE="legacy"
+export CHANNEL_CONTEXT_STRICT_IO="false"
+export CHANNEL_CONTEXT_MANUAL_COMPACT="false"
 ```
 
 Run one cycle:
@@ -39,6 +44,66 @@ Run continuously:
 ```bash
 python3 -m channel_runtime
 ```
+
+Apply a new Codex timeout in continuous mode:
+
+```bash
+export CHANNEL_CODEX_TIMEOUT_S="30.0"
+bash scripts/restart_channel_runtime.sh
+```
+
+`scripts/restart_channel_runtime.sh` gracefully stops the existing runtime process tracked in
+`.channel_runtime/channel_runtime.pid` and starts a new one with current environment values.
+
+## Telegram Context Management (P3)
+
+Context env vars and defaults:
+- `CHANNEL_CONTEXT_MODE` (`legacy` default; `durable` enables persistent transcript + compaction path)
+- `CHANNEL_CONTEXT_WINDOW_TOKENS` (`128000`)
+- `CHANNEL_CONTEXT_RESERVE_TOKENS` (`16000`)
+- `CHANNEL_CONTEXT_KEEP_RECENT_TOKENS` (`24000`)
+- `CHANNEL_CONTEXT_SUMMARY_MAX_TOKENS` (`1200`)
+- `CHANNEL_CONTEXT_MIN_GAIN_TOKENS` (`800`)
+- `CHANNEL_CONTEXT_COMPACTION_COOLDOWN_S` (`300`)
+- `CHANNEL_CONTEXT_STRICT_IO` (`false`)
+- `CHANNEL_CONTEXT_MANUAL_COMPACT` (`false`)
+
+Effective behavior notes:
+- Durable path is active only when `CHANNEL_CONTEXT_MODE=durable`.
+- `CHANNEL_CONTEXT_STRICT_IO=true` makes malformed durable transcript lines fail load (`context-store-load-error`) instead of being skipped.
+- `/ctx inspect` and `/ctx compact` are intercepted only when all are true:
+  - `CHANNEL_ORCHESTRATOR_MODE=codex`
+  - `CHANNEL_CONTEXT_MODE=durable`
+  - `CHANNEL_CONTEXT_MANUAL_COMPACT=true`
+- Parsed policy values `CHANNEL_CONTEXT_MIN_GAIN_TOKENS`, `CHANNEL_CONTEXT_COMPACTION_COOLDOWN_S`, and `CHANNEL_CONTEXT_SUMMARY_MAX_TOKENS` are reserved for subsequent wiring; current codex durable runtime uses fixed compaction policy inputs (`min_compaction_gain_tokens=0`, `cooldown_window_s=0.0`).
+
+Operator command output fields (`/ctx inspect` and `/ctx compact`):
+- `session_id`, `status`, `reason`, `tokens_before`, `tokens_after`, `gained_tokens`, `turns_before`, `turns_after`
+
+Rollback to legacy context mode:
+
+```bash
+export CHANNEL_CONTEXT_MODE="legacy"
+export CHANNEL_CONTEXT_MANUAL_COMPACT="false"
+bash scripts/restart_channel_runtime.sh
+```
+
+Legacy-path deprecation contract (TG-CTX-P4-T03):
+- `CHANNEL_CONTEXT_MODE=legacy` is the emergency kill-switch and remains supported for one release cycle after 2026-03-05.
+- Removal gate for legacy mode:
+  - durable-mode canary and full rollout stay stable for the full release cycle;
+  - no unresolved sev-1/sev-2 incidents attributable to durable context;
+  - operators validate rollback/runbook flows without requiring legacy mode.
+- If durable behavior regresses during the retention window, operators should immediately roll back with the command block above.
+
+P3 runtime payload additions for context triage:
+- `telemetry.context.mode`
+- `telemetry.context.compaction.*`
+- `telemetry.context.tokens.*`
+- `runtime_digest.context_mode`
+- `runtime_digest.context_compaction.*`
+- `runtime_digest.context_tokens.*`
+- heartbeat event `context.telemetry_digest.context_*` fields
 
 ## heartbeat_system (Need To Know)
 
@@ -164,3 +229,10 @@ bash scripts/run_telegram_channel_checks.sh
 - [TELEGRAM-CHANNEL-OPERATOR-RUNBOOK.md](TELEGRAM-CHANNEL-OPERATOR-RUNBOOK.md)
 - [TELEGRAM-TG-LIVE-E2-SMOKE-PROTOCOL.md](TELEGRAM-TG-LIVE-E2-SMOKE-PROTOCOL.md)
 - [TELEGRAM-CHANNEL-LIVE-CODEX-COMPLETION-PLAN.md](TELEGRAM-CHANNEL-LIVE-CODEX-COMPLETION-PLAN.md)
+
+## Context Schema Docs
+
+- Durable session metadata contract (`schema_version = 1`):
+  - `artifacts/schemas/context_session.schema.json`
+- Durable transcript entry contract (`schema_version = 1`):
+  - `artifacts/schemas/context_transcript_entry.schema.json`
