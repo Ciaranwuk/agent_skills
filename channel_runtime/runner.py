@@ -16,13 +16,15 @@ from telegram_channel.cursor_state import DurableCursorStateStore
 
 from .codex_orchestrator import CodexInvocationRequest, CodexOrchestrator, CodexSessionManager, CodexSessionPolicy
 from .config import RuntimeConfig
+from .context.compaction import CompactionPolicy, CompactionService
+from .context.store import ContextStore
 
 
 PublishSystemEventFn = Callable[..., dict[str, Any]]
 MemoryLookupFn = Callable[[str], str | None]
 CodexInvokeFn = Callable[[CodexInvocationRequest], str | None]
 DiagnosticEntry = tuple[str, dict[str, Any]]
-TelemetryDigest = dict[str, int]
+TelemetryDigest = dict[str, Any]
 
 _TELEMETRY_CONTRACT = "tg-live.runtime.telemetry"
 _TELEMETRY_VERSION = "2.0"
@@ -143,6 +145,62 @@ class AllowlistGateOrchestrator:
             diagnostics.extend(list(delegate_drain()))
         return diagnostics
 
+    def drain_context_telemetry(self) -> dict[str, Any]:
+        delegate_drain = getattr(self._delegate, "drain_context_telemetry", None)
+        if not callable(delegate_drain):
+            return {}
+        drained = delegate_drain()
+        if not isinstance(drained, Mapping):
+            return {}
+        return dict(drained)
+
+
+class DurableContextCanaryOrchestrator:
+    """Routes messages between durable and baseline delegates by chat ID canary allowlist."""
+
+    def __init__(
+        self,
+        *,
+        durable_delegate: OrchestratorPort,
+        baseline_delegate: OrchestratorPort,
+        canary_chat_ids: tuple[str, ...],
+        configured_mode: str,
+    ) -> None:
+        self._durable_delegate = durable_delegate
+        self._baseline_delegate = baseline_delegate
+        self._canary_chat_ids = {
+            normalized
+            for normalized in (_normalize_chat_id_value(value) for value in canary_chat_ids)
+            if normalized is not None
+        }
+        self._configured_mode = str(configured_mode).strip().lower()
+
+    def handle_message(self, inbound: InboundMessage, *, session_id: str) -> OutboundMessage | None:
+        delegate = self._baseline_delegate
+        chat_id = _normalize_chat_id_value(inbound.chat_id)
+        if chat_id in self._canary_chat_ids:
+            delegate = self._durable_delegate
+        return delegate.handle_message(inbound, session_id=session_id)
+
+    def drain_diagnostics(self) -> list[dict[str, Any]]:
+        diagnostics: list[dict[str, Any]] = []
+        for delegate in (self._durable_delegate, self._baseline_delegate):
+            delegate_drain = getattr(delegate, "drain_diagnostics", None)
+            if callable(delegate_drain):
+                drained = delegate_drain()
+                if isinstance(drained, list):
+                    diagnostics.extend(item for item in drained if isinstance(item, Mapping))
+        return diagnostics
+
+    def drain_context_telemetry(self) -> dict[str, Any]:
+        durable = _drain_delegate_context_telemetry(self._durable_delegate)
+        baseline = _drain_delegate_context_telemetry(self._baseline_delegate)
+        return _merge_context_telemetry(
+            durable,
+            baseline,
+            default_mode=self._configured_mode,
+        )
+
 
 def run_cycle(
     *,
@@ -184,6 +242,7 @@ def run_cycle(
         fetch_total: int,
         send_total: int,
         drop_total: int,
+        context_telemetry: Mapping[str, Any],
     ) -> bool:
         nonlocal heartbeat_emit_attempts
         nonlocal heartbeat_emit_failures
@@ -204,6 +263,7 @@ def run_cycle(
                 send_total=send_total,
                 drop_total=drop_total,
                 cycle_total_ms=_elapsed_ms(cycle_started_at),
+                context_telemetry=context_telemetry,
             ),
         )
         emitted = _emit_best_effort_failure(
@@ -220,6 +280,7 @@ def run_cycle(
         result = dict(process_once(resolved_adapter, gated_orchestrator, ack_policy=config.ack_policy))
     except Exception as exc:
         message = _sanitize_exception(exc)
+        context_telemetry = _drain_context_telemetry(gated_orchestrator, context_mode=config.context_mode)
         _emit_failure(
             text=f"channel-runtime process_once exception: {message}",
             base_context={
@@ -231,6 +292,7 @@ def run_cycle(
             fetch_total=0,
             send_total=0,
             drop_total=0,
+            context_telemetry=context_telemetry,
         )
         detail = _build_error_detail(
             code="runtime-process-once-exception",
@@ -255,6 +317,10 @@ def run_cycle(
             "dropped_count": 0,
             "dropped_updates": [],
         }
+        failed_result["runtime_digest"] = _build_runtime_digest(
+            context_mode=config.context_mode,
+            context_telemetry=context_telemetry,
+        )
         failed_result["telemetry"] = _build_runtime_telemetry(
             fetch_total=0,
             send_total=0,
@@ -266,12 +332,15 @@ def run_cycle(
                 emit_attempted=heartbeat_emit_attempts,
                 emit_failures=heartbeat_emit_failures,
             ),
+            context_mode=config.context_mode,
+            context_telemetry=context_telemetry,
         )
         return failed_result
 
     diagnostics: list[DiagnosticEntry] = []
     diagnostics.extend(_drain_diagnostics("orchestrator", gated_orchestrator))
     diagnostics.extend(_drain_diagnostics("adapter", resolved_adapter))
+    context_telemetry = _drain_context_telemetry(gated_orchestrator, context_mode=config.context_mode)
 
     dropped_updates: list[dict[str, str]] = []
     diagnostic_errors: list[str] = []
@@ -290,6 +359,7 @@ def run_cycle(
             fetch_total=int(result.get("fetched_count", 0)),
             send_total=int(result.get("sent_count", 0)),
             drop_total=0,
+            context_telemetry=context_telemetry,
         )
 
     for source, item in diagnostics:
@@ -313,6 +383,7 @@ def run_cycle(
             fetch_total=int(result.get("fetched_count", 0)),
             send_total=int(result.get("sent_count", 0)),
             drop_total=len(dropped_updates),
+            context_telemetry=context_telemetry,
         )
 
     if diagnostic_errors:
@@ -326,6 +397,10 @@ def run_cycle(
     result["dropped_updates"] = dropped_updates
     result["heartbeat_emit_failures"] = heartbeat_emit_failures
     result["error_details"] = _dedupe_error_details(service_error_details + diagnostic_error_details)
+    result["runtime_digest"] = _build_runtime_digest(
+        context_mode=config.context_mode,
+        context_telemetry=context_telemetry,
+    )
     result["telemetry"] = _build_runtime_telemetry(
         fetch_total=int(result.get("fetched_count", 0)),
         send_total=int(result.get("sent_count", 0)),
@@ -337,6 +412,8 @@ def run_cycle(
             emit_attempted=heartbeat_emit_attempts,
             emit_failures=heartbeat_emit_failures,
         ),
+        context_mode=config.context_mode,
+        context_telemetry=context_telemetry,
     )
     return result
 
@@ -434,12 +511,38 @@ def _build_telemetry_digest(
     send_total: int,
     drop_total: int,
     cycle_total_ms: int,
+    context_telemetry: Mapping[str, Any],
 ) -> TelemetryDigest:
+    counters = context_telemetry.get("counters")
+    gauges = context_telemetry.get("gauges")
+    if not isinstance(counters, Mapping):
+        counters = {}
+    if not isinstance(gauges, Mapping):
+        gauges = {}
     return {
         "fetch_total": int(fetch_total),
         "send_total": int(send_total),
         "drop_total": int(drop_total),
         "cycle_total_ms": int(cycle_total_ms),
+        "context_mode": str(context_telemetry.get("mode", "")).strip().lower(),
+        "context_compaction_attempted_total": int(counters.get("compaction_attempted_total", 0)),
+        "context_compaction_succeeded_total": int(counters.get("compaction_succeeded_total", 0)),
+        "context_compaction_failed_total": int(counters.get("compaction_failed_total", 0)),
+        "context_compaction_fallback_used_total": int(counters.get("compaction_fallback_used_total", 0)),
+        "context_compaction_reason_threshold_total": int(
+            _coerce_mapping_value(counters.get("compaction_reasons"), "threshold_total")
+        ),
+        "context_compaction_reason_overflow_total": int(
+            _coerce_mapping_value(counters.get("compaction_reasons"), "overflow_total")
+        ),
+        "context_compaction_reason_manual_total": int(
+            _coerce_mapping_value(counters.get("compaction_reasons"), "manual_total")
+        ),
+        "context_tokens_estimated_total": int(counters.get("tokens_estimated_total", 0)),
+        "context_tokens_build_failures_total": int(counters.get("build_failures_total", 0)),
+        "context_current_tokens_estimate": _coerce_optional_int(gauges.get("current_tokens_estimate")),
+        "context_summary_tokens_estimate": _coerce_optional_int(gauges.get("summary_tokens_estimate")),
+        "context_recent_tokens_estimate": _coerce_optional_int(gauges.get("recent_tokens_estimate")),
     }
 
 
@@ -463,10 +566,42 @@ def _build_runtime_telemetry(
     heartbeat_emit_failures: int,
     cycle_total_ms: int,
     heartbeat_emit_state: str,
+    context_mode: str,
+    context_telemetry: Mapping[str, Any],
 ) -> dict[str, Any]:
+    counters = context_telemetry.get("counters")
+    gauges = context_telemetry.get("gauges")
+    if not isinstance(counters, Mapping):
+        counters = {}
+    if not isinstance(gauges, Mapping):
+        gauges = {}
+    reason_counters = counters.get("compaction_reasons")
+    if not isinstance(reason_counters, Mapping):
+        reason_counters = {}
     return {
         "contract": _TELEMETRY_CONTRACT,
         "version": _TELEMETRY_VERSION,
+        "context": {
+            "mode": str(context_mode).strip().lower(),
+            "compaction": {
+                "attempted_total": int(counters.get("compaction_attempted_total", 0)),
+                "succeeded_total": int(counters.get("compaction_succeeded_total", 0)),
+                "failed_total": int(counters.get("compaction_failed_total", 0)),
+                "fallback_used_total": int(counters.get("compaction_fallback_used_total", 0)),
+                "reasons": {
+                    "threshold_total": int(reason_counters.get("threshold_total", 0)),
+                    "overflow_total": int(reason_counters.get("overflow_total", 0)),
+                    "manual_total": int(reason_counters.get("manual_total", 0)),
+                },
+            },
+            "tokens": {
+                "estimated_total": int(counters.get("tokens_estimated_total", 0)),
+                "build_failures_total": int(counters.get("build_failures_total", 0)),
+                "current_estimate": _coerce_optional_int(gauges.get("current_tokens_estimate")),
+                "summary_estimate": _coerce_optional_int(gauges.get("summary_tokens_estimate")),
+                "recent_estimate": _coerce_optional_int(gauges.get("recent_tokens_estimate")),
+            },
+        },
         "counters": {
             "fetch_total": int(fetch_total),
             "send_total": int(send_total),
@@ -486,6 +621,35 @@ def _build_runtime_telemetry(
     }
 
 
+def _build_runtime_digest(
+    *,
+    context_mode: str,
+    context_telemetry: Mapping[str, Any],
+) -> dict[str, Any]:
+    counters = context_telemetry.get("counters")
+    gauges = context_telemetry.get("gauges")
+    if not isinstance(counters, Mapping):
+        counters = {}
+    if not isinstance(gauges, Mapping):
+        gauges = {}
+    return {
+        "context_mode": str(context_mode).strip().lower(),
+        "context_compaction": {
+            "attempted_total": int(counters.get("compaction_attempted_total", 0)),
+            "succeeded_total": int(counters.get("compaction_succeeded_total", 0)),
+            "failed_total": int(counters.get("compaction_failed_total", 0)),
+            "fallback_used_total": int(counters.get("compaction_fallback_used_total", 0)),
+        },
+        "context_tokens": {
+            "estimated_total": int(counters.get("tokens_estimated_total", 0)),
+            "build_failures_total": int(counters.get("build_failures_total", 0)),
+            "current_estimate": _coerce_optional_int(gauges.get("current_tokens_estimate")),
+            "summary_estimate": _coerce_optional_int(gauges.get("summary_tokens_estimate")),
+            "recent_estimate": _coerce_optional_int(gauges.get("recent_tokens_estimate")),
+        },
+    }
+
+
 def _resolve_memory_hook_flag(explicit: bool | None) -> bool:
     if explicit is not None:
         return bool(explicit)
@@ -501,15 +665,25 @@ def _resolve_default_orchestrator(
     codex_invoke: CodexInvokeFn | None,
 ) -> OrchestratorPort:
     if config.orchestrator_mode == "codex":
-        session_policy = CodexSessionPolicy(
-            max_sessions=config.codex_session_max,
-            idle_ttl_s=config.codex_session_idle_ttl_s,
-        )
-        return CodexOrchestrator(
-            timeout_s=config.codex_timeout_s,
-            notify_on_error=config.notify_on_orchestrator_error,
-            invoke_fn=codex_invoke,
-            session_manager=CodexSessionManager(policy=session_policy),
+        if config.context_mode == "durable" and config.context_canary_chat_ids:
+            return DurableContextCanaryOrchestrator(
+                durable_delegate=_build_codex_orchestrator(
+                    config=config,
+                    codex_invoke=codex_invoke,
+                    context_mode="durable",
+                ),
+                baseline_delegate=_build_codex_orchestrator(
+                    config=config,
+                    codex_invoke=codex_invoke,
+                    context_mode="legacy",
+                ),
+                canary_chat_ids=config.context_canary_chat_ids,
+                configured_mode=config.context_mode,
+            )
+        return _build_codex_orchestrator(
+            config=config,
+            codex_invoke=codex_invoke,
+            context_mode=config.context_mode,
         )
 
     return DefaultOrchestrator(
@@ -583,6 +757,124 @@ def _normalize_chat_id_value(value: object) -> str | None:
         return str(int(text))
     except ValueError:
         return text
+
+
+def _build_codex_orchestrator(
+    *,
+    config: RuntimeConfig,
+    codex_invoke: CodexInvokeFn | None,
+    context_mode: str,
+) -> CodexOrchestrator:
+    session_policy = CodexSessionPolicy(
+        max_sessions=config.codex_session_max,
+        idle_ttl_s=config.codex_session_idle_ttl_s,
+    )
+    resolved_mode = str(context_mode).strip().lower()
+    context_store = None
+    compaction_service = None
+    compaction_policy = None
+    if resolved_mode == "durable":
+        context_store = ContextStore(strict_io=config.context_strict_io)
+        compaction_service = CompactionService(store=context_store)
+        compaction_policy = CompactionPolicy(
+            context_window_tokens=config.context_window_tokens,
+            reserve_tokens=config.context_reserve_tokens,
+            keep_recent_tokens=config.context_keep_recent_tokens,
+            min_compaction_gain_tokens=0,
+            cooldown_window_s=0.0,
+        )
+    return CodexOrchestrator(
+        timeout_s=config.codex_timeout_s,
+        notify_on_error=config.notify_on_orchestrator_error,
+        invoke_fn=codex_invoke,
+        session_manager=CodexSessionManager(policy=session_policy),
+        context_mode=resolved_mode,
+        context_store=context_store,
+        compaction_service=compaction_service,
+        compaction_policy=compaction_policy,
+        enable_context_operator_controls=config.context_manual_compact,
+    )
+
+
+def _drain_delegate_context_telemetry(target: Any) -> dict[str, Any]:
+    drain_fn = getattr(target, "drain_context_telemetry", None)
+    if not callable(drain_fn):
+        return {}
+    drained = drain_fn()
+    if not isinstance(drained, Mapping):
+        return {}
+    return dict(drained)
+
+
+def _merge_context_telemetry(
+    primary: Mapping[str, Any],
+    secondary: Mapping[str, Any],
+    *,
+    default_mode: str,
+) -> dict[str, Any]:
+    primary_counters = primary.get("counters")
+    secondary_counters = secondary.get("counters")
+    primary_gauges = primary.get("gauges")
+    secondary_gauges = secondary.get("gauges")
+    if not isinstance(primary_counters, Mapping):
+        primary_counters = {}
+    if not isinstance(secondary_counters, Mapping):
+        secondary_counters = {}
+    if not isinstance(primary_gauges, Mapping):
+        primary_gauges = {}
+    if not isinstance(secondary_gauges, Mapping):
+        secondary_gauges = {}
+    primary_reasons = primary_counters.get("compaction_reasons")
+    secondary_reasons = secondary_counters.get("compaction_reasons")
+    if not isinstance(primary_reasons, Mapping):
+        primary_reasons = {}
+    if not isinstance(secondary_reasons, Mapping):
+        secondary_reasons = {}
+    return {
+        "mode": str(default_mode).strip().lower(),
+        "counters": {
+            "tokens_estimated_total": int(primary_counters.get("tokens_estimated_total", 0))
+            + int(secondary_counters.get("tokens_estimated_total", 0)),
+            "compaction_attempted_total": int(primary_counters.get("compaction_attempted_total", 0))
+            + int(secondary_counters.get("compaction_attempted_total", 0)),
+            "compaction_succeeded_total": int(primary_counters.get("compaction_succeeded_total", 0))
+            + int(secondary_counters.get("compaction_succeeded_total", 0)),
+            "compaction_failed_total": int(primary_counters.get("compaction_failed_total", 0))
+            + int(secondary_counters.get("compaction_failed_total", 0)),
+            "compaction_fallback_used_total": int(primary_counters.get("compaction_fallback_used_total", 0))
+            + int(secondary_counters.get("compaction_fallback_used_total", 0)),
+            "compaction_reasons": {
+                "threshold_total": int(primary_reasons.get("threshold_total", 0))
+                + int(secondary_reasons.get("threshold_total", 0)),
+                "overflow_total": int(primary_reasons.get("overflow_total", 0))
+                + int(secondary_reasons.get("overflow_total", 0)),
+                "manual_total": int(primary_reasons.get("manual_total", 0))
+                + int(secondary_reasons.get("manual_total", 0)),
+            },
+            "build_failures_total": int(primary_counters.get("build_failures_total", 0))
+            + int(secondary_counters.get("build_failures_total", 0)),
+        },
+        "gauges": {
+            "current_tokens_estimate": _first_non_none(
+                primary_gauges.get("current_tokens_estimate"),
+                secondary_gauges.get("current_tokens_estimate"),
+            ),
+            "summary_tokens_estimate": _first_non_none(
+                primary_gauges.get("summary_tokens_estimate"),
+                secondary_gauges.get("summary_tokens_estimate"),
+            ),
+            "recent_tokens_estimate": _first_non_none(
+                primary_gauges.get("recent_tokens_estimate"),
+                secondary_gauges.get("recent_tokens_estimate"),
+            ),
+        },
+    }
+
+
+def _first_non_none(first: object, second: object) -> object:
+    if first is not None:
+        return first
+    return second
 
 
 def _map_process_once_errors(result: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -700,14 +992,21 @@ def _map_runtime_diagnostic(*, source: str, item: Mapping[str, Any]) -> dict[str
                 update_id=update_id,
                 chat_id=chat_id,
             )
+        is_context_code = _is_context_diagnostic_code(code)
+        layer = str(item.get("layer", "")).strip()
+        if not layer:
+            layer = "context" if is_context_code else "orchestrator"
+        operation = str(item.get("operation", "")).strip()
+        if not operation:
+            operation = _infer_context_diagnostic_operation(code) if is_context_code else "handle_message"
         return _build_error_detail(
             code=code or "orchestrator-error",
             message=message,
             retryable=bool(item.get("retryable", False)),
             source="orchestrator.diagnostics",
             category="error",
-            layer="orchestrator",
-            operation="handle_message",
+            layer=layer,
+            operation=operation,
             update_id=update_id,
             chat_id=chat_id,
             session_id=session_id,
@@ -811,3 +1110,76 @@ def _dedupe_error_details(details: list[dict[str, Any]]) -> list[dict[str, Any]]
         seen.add(fingerprint)
         unique.append(detail)
     return unique
+
+
+def _drain_context_telemetry(target: Any, *, context_mode: str) -> dict[str, Any]:
+    drain_fn = getattr(target, "drain_context_telemetry", None)
+    if not callable(drain_fn):
+        return _default_context_telemetry(context_mode=context_mode)
+    drained = drain_fn()
+    if not isinstance(drained, Mapping):
+        return _default_context_telemetry(context_mode=context_mode)
+
+    merged = _default_context_telemetry(context_mode=context_mode)
+    merged.update(dict(drained))
+    return merged
+
+
+def _default_context_telemetry(*, context_mode: str) -> dict[str, Any]:
+    return {
+        "mode": str(context_mode).strip().lower(),
+        "counters": {
+            "tokens_estimated_total": 0,
+            "compaction_attempted_total": 0,
+            "compaction_succeeded_total": 0,
+            "compaction_failed_total": 0,
+            "compaction_fallback_used_total": 0,
+            "compaction_reasons": {
+                "threshold_total": 0,
+                "overflow_total": 0,
+                "manual_total": 0,
+            },
+            "build_failures_total": 0,
+        },
+        "gauges": {
+            "current_tokens_estimate": None,
+            "summary_tokens_estimate": None,
+            "recent_tokens_estimate": None,
+        },
+    }
+
+
+def _coerce_optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_mapping_value(value: Any, key: str) -> int:
+    if not isinstance(value, Mapping):
+        return 0
+    try:
+        return int(value.get(key, 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_context_diagnostic_code(code: str) -> bool:
+    normalized = str(code or "").strip().lower()
+    return normalized.startswith("context-") or normalized == "context-build-failed"
+
+
+def _infer_context_diagnostic_operation(code: str) -> str:
+    normalized = str(code or "").strip().lower()
+    if normalized in {"context-store-load-error", "context-store-malformed-line", "context-store-invalid-record"}:
+        return "store_load"
+    if normalized in {"context-store-save-error"}:
+        return "store_save"
+    if normalized in {"context-assembler-error", "context-build-failed"}:
+        return "assemble"
+    if normalized in {"context-estimator-error"}:
+        return "estimate"
+    return "compact"

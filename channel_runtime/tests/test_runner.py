@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,7 +13,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from channel_core.contracts import ChannelRuntimeError, ConfigValidationError, InboundMessage, OutboundMessage
 from channel_runtime.codex_orchestrator import CodexInvocationRequest
 from channel_runtime import __main__ as runtime_main
-from channel_runtime.config import RuntimeConfig, parse_runtime_config
+from channel_runtime.config import (
+    LEGACY_CONTEXT_EMERGENCY_TOGGLE,
+    LEGACY_CONTEXT_MODE,
+    LEGACY_CONTEXT_RETENTION_RELEASES,
+    RuntimeConfig,
+    legacy_context_retention_plan,
+    parse_runtime_config,
+)
+from channel_runtime.context.contracts import ContextTurn
+from channel_runtime.context.store import ContextStore
 from channel_runtime.runner import DefaultOrchestrator, HeartbeatEventEmitter, run_cycle, run_loop
 from telegram_channel.adapter import TelegramChannelAdapter
 from telegram_channel.api import TelegramApiError
@@ -35,6 +45,16 @@ class TestRuntimeConfig(unittest.TestCase):
             "CHANNEL_STRICT_CURSOR_STATE_IO": "true",
             "CHANNEL_LIVE_MODE": "true",
             "CHANNEL_ONCE": "true",
+            "CHANNEL_CONTEXT_MODE": "durable",
+            "CHANNEL_CONTEXT_CANARY_CHAT_IDS": "100,200",
+            "CHANNEL_CONTEXT_WINDOW_TOKENS": "64000",
+            "CHANNEL_CONTEXT_RESERVE_TOKENS": "8000",
+            "CHANNEL_CONTEXT_KEEP_RECENT_TOKENS": "12000",
+            "CHANNEL_CONTEXT_SUMMARY_MAX_TOKENS": "1000",
+            "CHANNEL_CONTEXT_MIN_GAIN_TOKENS": "500",
+            "CHANNEL_CONTEXT_COMPACTION_COOLDOWN_S": "45",
+            "CHANNEL_CONTEXT_STRICT_IO": "true",
+            "CHANNEL_CONTEXT_MANUAL_COMPACT": "true",
         }
 
         cfg = parse_runtime_config([], env=env)
@@ -53,6 +73,16 @@ class TestRuntimeConfig(unittest.TestCase):
         self.assertTrue(cfg.strict_cursor_state_io)
         self.assertTrue(cfg.live_mode)
         self.assertTrue(cfg.once)
+        self.assertEqual(cfg.context_mode, "durable")
+        self.assertEqual(cfg.context_canary_chat_ids, ("100", "200"))
+        self.assertEqual(cfg.context_window_tokens, 64000)
+        self.assertEqual(cfg.context_reserve_tokens, 8000)
+        self.assertEqual(cfg.context_keep_recent_tokens, 12000)
+        self.assertEqual(cfg.context_summary_max_tokens, 1000)
+        self.assertEqual(cfg.context_min_gain_tokens, 500)
+        self.assertEqual(cfg.context_compaction_cooldown_s, 45.0)
+        self.assertTrue(cfg.context_strict_io)
+        self.assertTrue(cfg.context_manual_compact)
 
     def test_cli_overrides_env(self) -> None:
         env = {
@@ -87,6 +117,26 @@ class TestRuntimeConfig(unittest.TestCase):
                 "true",
                 "--live-mode",
                 "true",
+                "--context-mode",
+                "durable",
+                "--context-canary-chat-ids",
+                "101,202",
+                "--context-window-tokens",
+                "32000",
+                "--context-reserve-tokens",
+                "4000",
+                "--context-keep-recent-tokens",
+                "9000",
+                "--context-summary-max-tokens",
+                "900",
+                "--context-min-gain-tokens",
+                "450",
+                "--context-compaction-cooldown-s",
+                "30",
+                "--context-strict-io",
+                "true",
+                "--context-manual-compact",
+                "true",
                 "--once",
             ],
             env=env,
@@ -105,6 +155,61 @@ class TestRuntimeConfig(unittest.TestCase):
         self.assertTrue(cfg.strict_cursor_state_io)
         self.assertTrue(cfg.live_mode)
         self.assertTrue(cfg.once)
+        self.assertEqual(cfg.context_mode, "durable")
+        self.assertEqual(cfg.context_canary_chat_ids, ("101", "202"))
+        self.assertEqual(cfg.context_window_tokens, 32000)
+        self.assertEqual(cfg.context_reserve_tokens, 4000)
+        self.assertEqual(cfg.context_keep_recent_tokens, 9000)
+        self.assertEqual(cfg.context_summary_max_tokens, 900)
+        self.assertEqual(cfg.context_min_gain_tokens, 450)
+        self.assertEqual(cfg.context_compaction_cooldown_s, 30.0)
+        self.assertTrue(cfg.context_strict_io)
+        self.assertTrue(cfg.context_manual_compact)
+
+    def test_context_defaults_remain_legacy_compatible(self) -> None:
+        cfg = parse_runtime_config([], env={"CHANNEL_TOKEN": "x"})
+        self.assertEqual(cfg.context_mode, "legacy")
+        self.assertEqual(cfg.context_canary_chat_ids, ())
+        self.assertFalse(cfg.context_strict_io)
+        self.assertFalse(cfg.context_manual_compact)
+
+    def test_context_mode_explicit_emergency_toggle_is_supported(self) -> None:
+        cfg = parse_runtime_config(
+            [],
+            env={
+                "CHANNEL_TOKEN": "x",
+                "CHANNEL_CONTEXT_MODE": LEGACY_CONTEXT_MODE,
+            },
+        )
+        self.assertEqual(cfg.context_mode, LEGACY_CONTEXT_MODE)
+
+    def test_legacy_context_retention_plan_contract(self) -> None:
+        plan = legacy_context_retention_plan()
+        self.assertEqual(plan["mode"], LEGACY_CONTEXT_MODE)
+        self.assertEqual(plan["emergency_toggle"], LEGACY_CONTEXT_EMERGENCY_TOGGLE)
+        self.assertEqual(plan["retention_releases"], LEGACY_CONTEXT_RETENTION_RELEASES)
+        self.assertEqual(len(plan["removal_criteria"]), 3)
+
+    def test_context_canary_allowlist_env_alias_is_supported(self) -> None:
+        cfg = parse_runtime_config(
+            [],
+            env={
+                "CHANNEL_TOKEN": "x",
+                "CHANNEL_CONTEXT_CANARY_ALLOWLIST_CHAT_IDS": "303,404",
+            },
+        )
+        self.assertEqual(cfg.context_canary_chat_ids, ("303", "404"))
+
+    def test_context_canary_allowlist_env_alias_precedes_legacy_env(self) -> None:
+        cfg = parse_runtime_config(
+            [],
+            env={
+                "CHANNEL_TOKEN": "x",
+                "CHANNEL_CONTEXT_CANARY_ALLOWLIST_CHAT_IDS": "505",
+                "CHANNEL_CONTEXT_CANARY_CHAT_IDS": "606",
+            },
+        )
+        self.assertEqual(cfg.context_canary_chat_ids, ("505",))
 
     def test_invalid_token_fails_fast(self) -> None:
         with self.assertRaisesRegex(ConfigValidationError, "token must be a non-empty string"):
@@ -120,6 +225,10 @@ class TestRuntimeConfig(unittest.TestCase):
     def test_invalid_allowlist_fails_fast(self) -> None:
         with self.assertRaisesRegex(ConfigValidationError, "allowed_chat_ids must not contain empty values"):
             parse_runtime_config([], env={"CHANNEL_TOKEN": "x", "CHANNEL_ALLOWED_CHAT_IDS": "1,,3"})
+
+    def test_invalid_context_canary_allowlist_fails_fast(self) -> None:
+        with self.assertRaisesRegex(ConfigValidationError, "context_canary_chat_ids must not contain empty values"):
+            parse_runtime_config([], env={"CHANNEL_TOKEN": "x", "CHANNEL_CONTEXT_CANARY_CHAT_IDS": "1,,3"})
 
     def test_live_mode_allowlist_matrix(self) -> None:
         cfg = parse_runtime_config([], env={"CHANNEL_TOKEN": "x"})
@@ -179,6 +288,10 @@ class TestRuntimeConfig(unittest.TestCase):
         ):
             parse_runtime_config([], env={"CHANNEL_TOKEN": "x", "CHANNEL_ORCHESTRATOR_MODE": "unknown"})
 
+    def test_invalid_context_mode_rejected(self) -> None:
+        with self.assertRaisesRegex(ConfigValidationError, "context_mode must be 'legacy' or 'durable'"):
+            parse_runtime_config([], env={"CHANNEL_TOKEN": "x", "CHANNEL_CONTEXT_MODE": "preview"})
+
     def test_orchestrator_mode_whitespace_is_normalized(self) -> None:
         for raw_mode in ("codex ", " codex", "\tcodex\n"):
             with self.subTest(raw_mode=raw_mode):
@@ -202,9 +315,49 @@ class TestRuntimeConfig(unittest.TestCase):
         with self.assertRaisesRegex(ConfigValidationError, "codex_session_idle_ttl_s must be a positive number"):
             parse_runtime_config([], env={"CHANNEL_TOKEN": "x", "CHANNEL_CODEX_SESSION_IDLE_TTL_S": "0"})
 
+    def test_invalid_context_policy_fields_rejected(self) -> None:
+        with self.assertRaisesRegex(ConfigValidationError, "context_window_tokens must be an integer >= 1"):
+            parse_runtime_config([], env={"CHANNEL_TOKEN": "x", "CHANNEL_CONTEXT_WINDOW_TOKENS": "0"})
+        with self.assertRaisesRegex(ConfigValidationError, "context_reserve_tokens must be an integer >= 0"):
+            parse_runtime_config([], env={"CHANNEL_TOKEN": "x", "CHANNEL_CONTEXT_RESERVE_TOKENS": "-1"})
+        with self.assertRaisesRegex(ConfigValidationError, "context_keep_recent_tokens must be an integer >= 1"):
+            parse_runtime_config([], env={"CHANNEL_TOKEN": "x", "CHANNEL_CONTEXT_KEEP_RECENT_TOKENS": "0"})
+        with self.assertRaisesRegex(ConfigValidationError, "context_summary_max_tokens must be an integer >= 1"):
+            parse_runtime_config([], env={"CHANNEL_TOKEN": "x", "CHANNEL_CONTEXT_SUMMARY_MAX_TOKENS": "0"})
+        with self.assertRaisesRegex(ConfigValidationError, "context_min_gain_tokens must be an integer >= 0"):
+            parse_runtime_config([], env={"CHANNEL_TOKEN": "x", "CHANNEL_CONTEXT_MIN_GAIN_TOKENS": "-1"})
+        with self.assertRaisesRegex(ConfigValidationError, "context_compaction_cooldown_s must be a number >= 0"):
+            parse_runtime_config([], env={"CHANNEL_TOKEN": "x", "CHANNEL_CONTEXT_COMPACTION_COOLDOWN_S": "-0.1"})
+        with self.assertRaisesRegex(ConfigValidationError, "context_strict_io must be a boolean"):
+            parse_runtime_config([], env={"CHANNEL_TOKEN": "x", "CHANNEL_CONTEXT_STRICT_IO": "sometimes"})
+        with self.assertRaisesRegex(ConfigValidationError, "context_manual_compact must be a boolean"):
+            parse_runtime_config([], env={"CHANNEL_TOKEN": "x", "CHANNEL_CONTEXT_MANUAL_COMPACT": "sometimes"})
+        with self.assertRaisesRegex(
+            ConfigValidationError,
+            "context_window_tokens must be greater than context_reserve_tokens",
+        ):
+            parse_runtime_config(
+                [],
+                env={
+                    "CHANNEL_TOKEN": "x",
+                    "CHANNEL_CONTEXT_WINDOW_TOKENS": "1000",
+                    "CHANNEL_CONTEXT_RESERVE_TOKENS": "1000",
+                },
+            )
+
     def test_unknown_cli_argument_rejected(self) -> None:
         with self.assertRaisesRegex(ConfigValidationError, "unknown argument: --bad"):
             parse_runtime_config(["--bad"], env={"CHANNEL_TOKEN": "x"})
+
+    def test_context_canary_allowlist_cli_alias_is_supported(self) -> None:
+        cfg = parse_runtime_config(
+            [
+                "--context-canary-allowlist-chat-ids",
+                "707,808",
+            ],
+            env={"CHANNEL_TOKEN": "x"},
+        )
+        self.assertEqual(cfg.context_canary_chat_ids, ("707", "808"))
 
 
 @dataclass
@@ -415,9 +568,18 @@ class TestRuntimeRunnerP2(unittest.TestCase):
         self.assertEqual(adapter.sent[0].chat_id, "501")
         self.assertEqual(adapter.sent[0].text, "echo: ping")
         self.assertEqual(adapter.sent[0].reply_to_message_id, "m-1")
+        self.assertEqual(result["runtime_digest"]["context_mode"], "legacy")
+        self.assertEqual(result["runtime_digest"]["context_compaction"]["attempted_total"], 0)
+        self.assertEqual(result["runtime_digest"]["context_tokens"]["estimated_total"], 0)
         self.assertIn("telemetry", result)
         self.assertEqual(result["telemetry"]["contract"], "tg-live.runtime.telemetry")
         self.assertEqual(result["telemetry"]["version"], "2.0")
+        self.assertEqual(result["telemetry"]["context"]["mode"], "legacy")
+        self.assertEqual(result["telemetry"]["context"]["compaction"]["attempted_total"], 0)
+        self.assertEqual(result["telemetry"]["context"]["compaction"]["succeeded_total"], 0)
+        self.assertEqual(result["telemetry"]["context"]["compaction"]["failed_total"], 0)
+        self.assertEqual(result["telemetry"]["context"]["tokens"]["estimated_total"], 0)
+        self.assertIsNone(result["telemetry"]["context"]["tokens"]["current_estimate"])
         self.assertEqual(result["telemetry"]["heartbeat"]["emit_state"], "disabled")
         self.assertEqual(result["telemetry"]["counters"]["fetch_total"], result["fetched_count"])
         self.assertEqual(result["telemetry"]["counters"]["send_total"], result["sent_count"])
@@ -561,6 +723,13 @@ class TestRuntimeRunnerP2(unittest.TestCase):
         self.assertIn("send_total", context["telemetry_digest"])
         self.assertIn("drop_total", context["telemetry_digest"])
         self.assertIn("cycle_total_ms", context["telemetry_digest"])
+        self.assertIn("context_mode", context["telemetry_digest"])
+        self.assertIn("context_compaction_attempted_total", context["telemetry_digest"])
+        self.assertIn("context_tokens_estimated_total", context["telemetry_digest"])
+        self.assertIn("context_compaction_fallback_used_total", context["telemetry_digest"])
+        self.assertIn("context_tokens_build_failures_total", context["telemetry_digest"])
+        self.assertIn("context_summary_tokens_estimate", context["telemetry_digest"])
+        self.assertIn("context_recent_tokens_estimate", context["telemetry_digest"])
         self.assertNotIn("telemetry", context)
 
     def test_heartbeat_emit_state_disabled_when_emitter_disabled_on_failure(self) -> None:
@@ -574,6 +743,132 @@ class TestRuntimeRunnerP2(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["heartbeat_emit_failures"], 0)
         self.assertEqual(result["telemetry"]["heartbeat"]["emit_state"], "disabled")
+
+    def test_context_diagnostics_and_telemetry_are_emitted_additively(self) -> None:
+        adapter = _AdapterStub(updates=[_inbound("1", text="ping", chat_id="501")])
+        publisher = _RecordingPublisher(fail=False)
+
+        class _ContextAwareOrchestrator:
+            def __init__(self) -> None:
+                self._diagnostics = [
+                    {
+                        "code": "context-build-failed",
+                        "message": "context assemble failed",
+                        "retryable": True,
+                        "layer": "context",
+                        "operation": "assemble",
+                        "update_id": "1",
+                        "session_id": "telegram:501",
+                    }
+                ]
+
+            def handle_message(self, inbound: InboundMessage, *, session_id: str) -> OutboundMessage | None:
+                _ = (inbound, session_id)
+                return None
+
+            def drain_diagnostics(self) -> list[dict[str, Any]]:
+                drained = list(self._diagnostics)
+                self._diagnostics.clear()
+                return drained
+
+            def drain_context_telemetry(self) -> dict[str, Any]:
+                return {
+                    "mode": "durable",
+                    "counters": {
+                        "tokens_estimated_total": 321,
+                        "compaction_attempted_total": 2,
+                        "compaction_succeeded_total": 1,
+                        "compaction_failed_total": 1,
+                        "compaction_fallback_used_total": 1,
+                        "compaction_reasons": {
+                            "threshold_total": 0,
+                            "overflow_total": 2,
+                            "manual_total": 0,
+                        },
+                        "build_failures_total": 1,
+                    },
+                    "gauges": {
+                        "current_tokens_estimate": 210,
+                        "summary_tokens_estimate": 25,
+                        "recent_tokens_estimate": 185,
+                    },
+                }
+
+        result = run_cycle(
+            config=RuntimeConfig(token="tkn", context_mode="durable"),
+            adapter=adapter,
+            orchestrator=_ContextAwareOrchestrator(),
+            heartbeat_emitter=HeartbeatEventEmitter(publish_event=publisher),
+        )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["reason"], "completed-with-errors")
+        self.assertEqual(result["error_count"], 1)
+        self.assertEqual(result["telemetry"]["context"]["mode"], "durable")
+        self.assertEqual(result["telemetry"]["context"]["compaction"]["attempted_total"], 2)
+        self.assertEqual(result["telemetry"]["context"]["compaction"]["succeeded_total"], 1)
+        self.assertEqual(result["telemetry"]["context"]["compaction"]["failed_total"], 1)
+        self.assertEqual(result["telemetry"]["context"]["tokens"]["estimated_total"], 321)
+        self.assertEqual(result["telemetry"]["context"]["tokens"]["current_estimate"], 210)
+        self.assertEqual(result["runtime_digest"]["context_mode"], "durable")
+        self.assertEqual(result["runtime_digest"]["context_compaction"]["attempted_total"], 2)
+        self.assertEqual(result["runtime_digest"]["context_tokens"]["estimated_total"], 321)
+        self.assertEqual(len(result["error_details"]), 1)
+        self.assertEqual(result["error_details"][0]["context"]["layer"], "context")
+        self.assertEqual(result["error_details"][0]["context"]["operation"], "assemble")
+        self.assertEqual(len(publisher.calls), 1)
+        digest = publisher.calls[0]["context"]["telemetry_digest"]
+        self.assertEqual(digest["context_mode"], "durable")
+        self.assertEqual(digest["context_compaction_attempted_total"], 2)
+        self.assertEqual(digest["context_compaction_succeeded_total"], 1)
+        self.assertEqual(digest["context_compaction_failed_total"], 1)
+        self.assertEqual(digest["context_compaction_fallback_used_total"], 1)
+        self.assertEqual(digest["context_compaction_reason_overflow_total"], 2)
+        self.assertEqual(digest["context_tokens_estimated_total"], 321)
+        self.assertEqual(digest["context_tokens_build_failures_total"], 1)
+        self.assertEqual(digest["context_current_tokens_estimate"], 210)
+        self.assertEqual(digest["context_summary_tokens_estimate"], 25)
+        self.assertEqual(digest["context_recent_tokens_estimate"], 185)
+
+    def test_context_diagnostic_without_explicit_operation_maps_deterministically(self) -> None:
+        adapter = _AdapterStub(updates=[_inbound("1", text="ping", chat_id="501")])
+
+        class _ContextDiagnosticOrchestrator:
+            def __init__(self) -> None:
+                self._diagnostics = [
+                    {
+                        "code": "context-store-load-error",
+                        "message": "context store unavailable",
+                        "retryable": True,
+                        "update_id": "1",
+                        "session_id": "telegram:501",
+                    }
+                ]
+
+            def handle_message(self, inbound: InboundMessage, *, session_id: str) -> OutboundMessage | None:
+                _ = (inbound, session_id)
+                return None
+
+            def drain_diagnostics(self) -> list[dict[str, Any]]:
+                drained = list(self._diagnostics)
+                self._diagnostics.clear()
+                return drained
+
+        result = run_cycle(
+            config=RuntimeConfig(token="tkn", context_mode="durable"),
+            adapter=adapter,
+            orchestrator=_ContextDiagnosticOrchestrator(),
+            heartbeat_emitter=HeartbeatEventEmitter(enabled=False),
+        )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["reason"], "completed-with-errors")
+        self.assertEqual(result["error_count"], 1)
+        self.assertEqual(len(result["error_details"]), 1)
+        detail = result["error_details"][0]
+        self.assertEqual(detail["code"], "context-store-load-error")
+        self.assertEqual(detail["context"]["layer"], "context")
+        self.assertEqual(detail["context"]["operation"], "store_load")
 
     def test_allowlist_drops_before_orchestration_and_send(self) -> None:
         adapter = _AdapterStub(updates=[_inbound("1", text="hidden", chat_id="999")])
@@ -728,6 +1023,214 @@ class TestRuntimeRunnerP2(unittest.TestCase):
         detail = result["error_details"][0]
         self.assertEqual(detail["code"], "codex-timeout")
         self.assertTrue(detail["retryable"])
+
+    def test_codex_mode_runtime_wires_durable_context_store_and_uses_persisted_history(self) -> None:
+        requests: list[CodexInvocationRequest] = []
+
+        def _invoke(request: CodexInvocationRequest) -> str | None:
+            requests.append(request)
+            return f"done:{request.text}"
+
+        config = RuntimeConfig(
+            token="tkn",
+            orchestrator_mode="codex",
+            context_mode="durable",
+            context_strict_io=True,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ContextStore(root_dir=Path(tmpdir) / "context", strict_io=True)
+            with patch("channel_runtime.runner.ContextStore", return_value=store) as store_ctor:
+                first = run_cycle(
+                    config=config,
+                    adapter=_AdapterStub(updates=[_inbound("1", text="first", chat_id="77")]),
+                    codex_invoke=_invoke,
+                    heartbeat_emitter=HeartbeatEventEmitter(enabled=False),
+                )
+                second = run_cycle(
+                    config=config,
+                    adapter=_AdapterStub(updates=[_inbound("2", text="second", chat_id="77")]),
+                    codex_invoke=_invoke,
+                    heartbeat_emitter=HeartbeatEventEmitter(enabled=False),
+                )
+
+        self.assertEqual(first["status"], "ok")
+        self.assertEqual(second["status"], "ok")
+        self.assertEqual(requests[0].conversation_history, ())
+        self.assertEqual(
+            requests[1].conversation_history,
+            ({"user_text": "first", "assistant_text": "done:first"},),
+        )
+        self.assertEqual(store_ctor.call_args.kwargs, {"strict_io": True})
+
+    def test_codex_mode_context_canary_non_allowlisted_chat_stays_legacy_baseline(self) -> None:
+        requests: list[CodexInvocationRequest] = []
+
+        def _invoke(request: CodexInvocationRequest) -> str | None:
+            requests.append(request)
+            return f"done:{request.text}"
+
+        config = RuntimeConfig(
+            token="tkn",
+            orchestrator_mode="codex",
+            context_mode="durable",
+            context_canary_chat_ids=("77",),
+            context_strict_io=True,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ContextStore(root_dir=Path(tmpdir) / "context", strict_io=True)
+            with patch("channel_runtime.runner.ContextStore", return_value=store):
+                first = run_cycle(
+                    config=config,
+                    adapter=_AdapterStub(updates=[_inbound("1", text="first", chat_id="88")]),
+                    codex_invoke=_invoke,
+                    heartbeat_emitter=HeartbeatEventEmitter(enabled=False),
+                )
+                second = run_cycle(
+                    config=config,
+                    adapter=_AdapterStub(updates=[_inbound("2", text="second", chat_id="88")]),
+                    codex_invoke=_invoke,
+                    heartbeat_emitter=HeartbeatEventEmitter(enabled=False),
+                )
+
+        self.assertEqual(first["status"], "ok")
+        self.assertEqual(second["status"], "ok")
+        self.assertEqual(requests[0].conversation_history, ())
+        self.assertEqual(requests[1].conversation_history, ())
+        transcript = store.load_transcript(session_id="telegram:88")
+        self.assertEqual(transcript, ())
+
+    def test_codex_mode_context_canary_allowlisted_chat_uses_durable_history(self) -> None:
+        requests: list[CodexInvocationRequest] = []
+
+        def _invoke(request: CodexInvocationRequest) -> str | None:
+            requests.append(request)
+            return f"done:{request.text}"
+
+        config = RuntimeConfig(
+            token="tkn",
+            orchestrator_mode="codex",
+            context_mode="durable",
+            context_canary_chat_ids=("77",),
+            context_strict_io=True,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ContextStore(root_dir=Path(tmpdir) / "context", strict_io=True)
+            with patch("channel_runtime.runner.ContextStore", return_value=store):
+                first = run_cycle(
+                    config=config,
+                    adapter=_AdapterStub(updates=[_inbound("1", text="first", chat_id="77")]),
+                    codex_invoke=_invoke,
+                    heartbeat_emitter=HeartbeatEventEmitter(enabled=False),
+                )
+                second = run_cycle(
+                    config=config,
+                    adapter=_AdapterStub(updates=[_inbound("2", text="second", chat_id="77")]),
+                    codex_invoke=_invoke,
+                    heartbeat_emitter=HeartbeatEventEmitter(enabled=False),
+                )
+                transcript = store.load_transcript(session_id="telegram:77")
+
+        self.assertEqual(first["status"], "ok")
+        self.assertEqual(second["status"], "ok")
+        self.assertEqual(requests[0].conversation_history, ())
+        self.assertEqual(
+            requests[1].conversation_history,
+            ({"user_text": "first", "assistant_text": "done:first"},),
+        )
+        self.assertEqual(len(transcript), 4)
+
+    def test_codex_mode_default_legacy_does_not_construct_context_store(self) -> None:
+        adapter = _AdapterStub(updates=[_inbound("1", text="solve", chat_id="77")])
+
+        with patch("channel_runtime.runner.ContextStore") as store_ctor:
+            result = run_cycle(
+                config=RuntimeConfig(token="tkn", orchestrator_mode="codex"),
+                adapter=adapter,
+                codex_invoke=lambda req: f"ok:{req.text}",
+                heartbeat_emitter=HeartbeatEventEmitter(enabled=False),
+            )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["sent_count"], 1)
+        store_ctor.assert_not_called()
+
+    def test_codex_mode_legacy_explicit_rollback_ignores_context_canary_allowlist(self) -> None:
+        adapter = _AdapterStub(updates=[_inbound("1", text="solve", chat_id="77")])
+
+        with patch("channel_runtime.runner.ContextStore") as store_ctor:
+            result = run_cycle(
+                config=RuntimeConfig(
+                    token="tkn",
+                    orchestrator_mode="codex",
+                    context_mode="legacy",
+                    context_canary_chat_ids=("77",),
+                ),
+                adapter=adapter,
+                codex_invoke=lambda req: f"ok:{req.text}",
+                heartbeat_emitter=HeartbeatEventEmitter(enabled=False),
+            )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["sent_count"], 1)
+        store_ctor.assert_not_called()
+
+    def test_codex_mode_manual_context_operator_command_path_wired_by_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ContextStore(root_dir=Path(tmpdir) / "context", strict_io=False)
+            for index in range(4):
+                store.append_turn(session_id="telegram:77", turn=ContextTurn(role="user", text=f"user-{index} " + ("x" * 80)))
+                store.append_turn(
+                    session_id="telegram:77",
+                    turn=ContextTurn(role="assistant", text=f"assistant-{index} " + ("y" * 80)),
+                )
+
+            adapter = _AdapterStub(updates=[_inbound("1", text="/ctx compact", chat_id="77")])
+            with patch("channel_runtime.runner.ContextStore", return_value=store):
+                result = run_cycle(
+                    config=RuntimeConfig(
+                        token="tkn",
+                        orchestrator_mode="codex",
+                        context_mode="durable",
+                        context_manual_compact=True,
+                    ),
+                    adapter=adapter,
+                    codex_invoke=lambda _: (_ for _ in ()).throw(AssertionError("codex invoke should not run for /ctx compact")),
+                    heartbeat_emitter=HeartbeatEventEmitter(enabled=False),
+                )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["sent_count"], 1)
+        self.assertIn("context compact:", adapter.sent[0].text)
+        self.assertEqual(result["telemetry"]["context"]["compaction"]["attempted_total"], 1)
+        self.assertEqual(result["telemetry"]["context"]["compaction"]["reasons"]["manual_total"], 1)
+
+    def test_codex_mode_context_operator_inspect_command_path_wired_by_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ContextStore(root_dir=Path(tmpdir) / "context", strict_io=False)
+            store.append_turn(session_id="telegram:77", turn=ContextTurn(role="user", text="hello"))
+            store.append_turn(session_id="telegram:77", turn=ContextTurn(role="assistant", text="world"))
+
+            adapter = _AdapterStub(updates=[_inbound("1", text="/ctx inspect", chat_id="77")])
+            with patch("channel_runtime.runner.ContextStore", return_value=store):
+                result = run_cycle(
+                    config=RuntimeConfig(
+                        token="tkn",
+                        orchestrator_mode="codex",
+                        context_mode="durable",
+                        context_manual_compact=True,
+                    ),
+                    adapter=adapter,
+                    codex_invoke=lambda _: (_ for _ in ()).throw(AssertionError("codex invoke should not run for /ctx inspect")),
+                    heartbeat_emitter=HeartbeatEventEmitter(enabled=False),
+                )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["sent_count"], 1)
+        self.assertIn("context inspect:", adapter.sent[0].text)
+        self.assertIn("status=ok", adapter.sent[0].text)
+        self.assertIn("reason=session-found", adapter.sent[0].text)
+        self.assertIn("tokens_before=", adapter.sent[0].text)
+        self.assertIn("tokens_after=", adapter.sent[0].text)
 
     def test_on_success_ack_policy_skips_ack_when_send_fails(self) -> None:
         adapter = _AdapterStub(updates=[_inbound("1", text="first")], fail_send_calls={1})
@@ -929,6 +1432,7 @@ class TestRuntimeRunnerP2(unittest.TestCase):
         self.assertEqual(detail["context"]["chat_id"], "")
         self.assertEqual(detail["context"]["session_id"], "")
         self.assertIn("telemetry", result)
+        self.assertIn("runtime_digest", result)
         self.assertEqual(result["telemetry"]["contract"], "tg-live.runtime.telemetry")
         self.assertEqual(result["telemetry"]["heartbeat"]["emit_state"], "disabled")
 
