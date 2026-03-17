@@ -170,6 +170,9 @@ class TestRuntimeConfig(unittest.TestCase):
         cfg = parse_runtime_config([], env={"CHANNEL_TOKEN": "x"})
         self.assertEqual(cfg.context_mode, "legacy")
         self.assertEqual(cfg.context_canary_chat_ids, ())
+        self.assertEqual(cfg.context_window_tokens, 28000)
+        self.assertEqual(cfg.context_reserve_tokens, 8000)
+        self.assertEqual(cfg.context_keep_recent_tokens, 12000)
         self.assertFalse(cfg.context_strict_io)
         self.assertFalse(cfg.context_manual_compact)
 

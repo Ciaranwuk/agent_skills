@@ -30,9 +30,9 @@ class RuntimeConfig:
     once: bool = False
     context_mode: str = LEGACY_CONTEXT_MODE
     context_canary_chat_ids: tuple[str, ...] = ()
-    context_window_tokens: int = 128000
-    context_reserve_tokens: int = 16000
-    context_keep_recent_tokens: int = 24000
+    context_window_tokens: int = 28000
+    context_reserve_tokens: int = 8000
+    context_keep_recent_tokens: int = 12000
     context_summary_max_tokens: int = 1200
     context_min_gain_tokens: int = 800
     context_compaction_cooldown_s: float = 300.0
@@ -126,9 +126,9 @@ def parse_runtime_config(
             "CHANNEL_CONTEXT_CANARY_ALLOWLIST_CHAT_IDS",
             source_env.get("CHANNEL_CONTEXT_CANARY_CHAT_IDS", ""),
         ),
-        "context_window_tokens": source_env.get("CHANNEL_CONTEXT_WINDOW_TOKENS", "128000"),
-        "context_reserve_tokens": source_env.get("CHANNEL_CONTEXT_RESERVE_TOKENS", "16000"),
-        "context_keep_recent_tokens": source_env.get("CHANNEL_CONTEXT_KEEP_RECENT_TOKENS", "24000"),
+        "context_window_tokens": source_env.get("CHANNEL_CONTEXT_WINDOW_TOKENS", "28000"),
+        "context_reserve_tokens": source_env.get("CHANNEL_CONTEXT_RESERVE_TOKENS", "8000"),
+        "context_keep_recent_tokens": source_env.get("CHANNEL_CONTEXT_KEEP_RECENT_TOKENS", "12000"),
         "context_summary_max_tokens": source_env.get("CHANNEL_CONTEXT_SUMMARY_MAX_TOKENS", "1200"),
         "context_min_gain_tokens": source_env.get("CHANNEL_CONTEXT_MIN_GAIN_TOKENS", "800"),
         "context_compaction_cooldown_s": source_env.get("CHANNEL_CONTEXT_COMPACTION_COOLDOWN_S", "300"),
