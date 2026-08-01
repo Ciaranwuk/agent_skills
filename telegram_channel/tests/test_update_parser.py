@@ -71,6 +71,100 @@ class TestUpdateParser(unittest.TestCase):
         self.assertIsNone(parsed.inbound)
         self.assertEqual(parsed.skip_reason, "unsupported-message-text")
 
+    def test_parse_voice_message_normalizes_placeholder_and_metadata(self) -> None:
+        parsed = parse_update(
+            {
+                "update_id": 14,
+                "message": {
+                    "message_id": 88,
+                    "date": 1700000002,
+                    "chat": {"id": 10},
+                    "from": {"id": 20},
+                    "voice": {
+                        "file_id": "voice-file-1",
+                        "file_unique_id": "voice-uniq-1",
+                        "duration": 9,
+                        "mime_type": "audio/ogg",
+                        "file_size": 12345,
+                    },
+                },
+            }
+        )
+
+        self.assertIsNotNone(parsed.inbound)
+        assert parsed.inbound is not None
+        self.assertEqual(parsed.inbound.text, "[Voice note]")
+        self.assertEqual(parsed.inbound.metadata["content_type"], "voice")
+        self.assertEqual(parsed.inbound.metadata["telegram_voice"]["file_id"], "voice-file-1")
+        self.assertEqual(parsed.inbound.metadata["telegram_voice"]["duration_s"], 9)
+
+    def test_parse_voice_message_without_file_id_is_safe_skip(self) -> None:
+        parsed = parse_update(
+            {
+                "update_id": 15,
+                "message": {
+                    "message_id": 89,
+                    "chat": {"id": 10},
+                    "from": {"id": 20},
+                    "voice": {"file_unique_id": "missing-file-id"},
+                },
+            }
+        )
+
+        self.assertIsNone(parsed.inbound)
+        self.assertEqual(parsed.skip_reason, "unsupported-message-voice")
+
+    def test_parse_voice_message_maps_placeholder_and_metadata(self) -> None:
+        parsed = parse_update(
+            {
+                "update_id": 14,
+                "message": {
+                    "message_id": 88,
+                    "date": 1700000002,
+                    "chat": {"id": -100123},
+                    "from": {"id": 991},
+                    "voice": {
+                        "file_id": "voice-file-1",
+                        "file_unique_id": "voice-uniq-1",
+                        "duration": "17",
+                        "mime_type": "audio/ogg",
+                        "file_size": "2048",
+                    },
+                },
+            }
+        )
+
+        self.assertIsNotNone(parsed.inbound)
+        assert parsed.inbound is not None
+        self.assertEqual(parsed.inbound.text, "[Voice note]")
+        self.assertEqual(parsed.inbound.metadata["content_type"], "voice")
+        self.assertEqual(
+            parsed.inbound.metadata["telegram_voice"],
+            {
+                "file_id": "voice-file-1",
+                "file_unique_id": "voice-uniq-1",
+                "duration_s": 17,
+                "mime_type": "audio/ogg",
+                "file_size": 2048,
+            },
+        )
+
+    def test_parse_voice_message_without_file_id_is_safe_skip(self) -> None:
+        parsed = parse_update(
+            {
+                "update_id": 15,
+                "message": {
+                    "message_id": 89,
+                    "chat": {"id": -100123},
+                    "from": {"id": 991},
+                    "voice": {"file_id": "   "},
+                },
+            }
+        )
+
+        self.assertIsNone(parsed.inbound)
+        self.assertEqual(parsed.skip_reason, "unsupported-message-voice")
+
     def test_parse_invalid_update_id_is_safe_skip(self) -> None:
         parsed = parse_update({"update_id": " ", "message": {"text": "x"}})
         self.assertIsNone(parsed.inbound)
@@ -244,6 +338,60 @@ class TestTelegramApiClient(unittest.TestCase):
         self.assertEqual(calls["count"], 2)
         self.assertEqual(sleeps, [0.4])
         self.assertEqual(updates[0]["update_id"], 6)
+
+    def test_get_file_returns_result_object(self) -> None:
+        def opener(req, timeout):
+            self.assertTrue(req.full_url.endswith("/getFile"))
+            return _FakeResponse(b'{"ok":true,"result":{"file_path":"voice/file.ogg"}}')
+
+        client = TelegramApiClient(token="abc", opener=opener)
+
+        result = client.get_file(file_id="voice-file-1")
+
+        self.assertEqual(result["file_path"], "voice/file.ogg")
+
+    def test_send_voice_posts_multipart_payload(self) -> None:
+        captured: dict[str, object] = {}
+
+        def opener(req, timeout):
+            captured["url"] = req.full_url
+            captured["content_type"] = req.headers.get("Content-type")
+            captured["body"] = req.data
+            return _FakeResponse(b'{"ok":true,"result":{"message_id":123}}')
+
+        client = TelegramApiClient(token="abc", opener=opener)
+
+        result = client.send_voice(
+            chat_id="55",
+            voice_bytes=b"ogg-bytes",
+            filename="reply.ogg",
+            reply_to_message_id="7",
+            caption="spoken",
+        )
+
+        self.assertEqual(result["message_id"], 123)
+        self.assertEqual(captured["url"], "https://api.telegram.org/botabc/sendVoice")
+        self.assertIn("multipart/form-data; boundary=", str(captured["content_type"]))
+        body = captured["body"]
+        self.assertIsInstance(body, bytes)
+        assert isinstance(body, bytes)
+        self.assertIn(b'name="chat_id"\r\n\r\n55', body)
+        self.assertIn(b'name="reply_to_message_id"\r\n\r\n7', body)
+        self.assertIn(b'name="caption"\r\n\r\nspoken', body)
+        self.assertIn(b'name="voice"; filename="reply.ogg"', body)
+        self.assertIn(b"Content-Type: audio/ogg", body)
+        self.assertIn(b"ogg-bytes", body)
+
+    def test_download_file_returns_bytes(self) -> None:
+        def opener(req, timeout):
+            self.assertIn("/file/botabc/voice/file.ogg", req.full_url)
+            return _FakeResponse(b"voice-bytes")
+
+        client = TelegramApiClient(token="abc", opener=opener)
+
+        payload = client.download_file(file_path="voice/file.ogg")
+
+        self.assertEqual(payload, b"voice-bytes")
 
     def test_http_429_retry_after_header_is_parsed(self) -> None:
         calls = {"count": 0}

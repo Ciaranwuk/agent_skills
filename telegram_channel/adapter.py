@@ -6,7 +6,9 @@ from channel_core.contracts import ChannelAdapterPort, ChannelRuntimeError, Inbo
 
 from .api import TelegramApiClient, TelegramApiError
 from .cursor_state import CursorStateError, DurableCursorStateStore
+from .tts import TelegramTextToSpeechProcessor, TextToSpeechSynthesisError
 from .update_parser import parse_update
+from .voice_notes import TelegramVoiceNoteProcessor, VoiceNoteProcessingError
 
 
 class TelegramChannelAdapter(ChannelAdapterPort):
@@ -18,10 +20,14 @@ class TelegramChannelAdapter(ChannelAdapterPort):
         *,
         cursor_state_store: DurableCursorStateStore | None = None,
         strict_state_io: bool = False,
+        voice_note_processor: TelegramVoiceNoteProcessor | None = None,
+        text_to_speech_processor: TelegramTextToSpeechProcessor | None = None,
     ) -> None:
         self._api = api_client
         self._cursor_state_store = cursor_state_store
         self._strict_state_io = bool(strict_state_io)
+        self._voice_note_processor = voice_note_processor
+        self._text_to_speech_processor = text_to_speech_processor
         self._diagnostics: list[dict[str, str]] = []
         self._seen_update_ids: set[int] = set()
         self._pending_ack_ids: set[int] = set()
@@ -64,18 +70,31 @@ class TelegramChannelAdapter(ChannelAdapterPort):
                 self._processed_ids.add(update_id)
                 continue
 
-            self._seen_update_ids.add(update_id)
             if parsed.inbound is None:
+                self._seen_update_ids.add(update_id)
                 self._processed_ids.add(update_id)
                 continue
 
+            inbound = parsed.inbound
+            if self._is_voice_note(inbound):
+                resolved = self._resolve_voice_note(update_id=update_id, inbound=inbound)
+                if resolved is None:
+                    self._seen_update_ids.add(update_id)
+                    self._processed_ids.add(update_id)
+                    continue
+                inbound = resolved
+
+            self._seen_update_ids.add(update_id)
             self._pending_ack_ids.add(update_id)
-            normalized.append(parsed.inbound)
+            normalized.append(inbound)
 
         self._recompute_offset()
         return normalized
 
     def send_message(self, outbound: OutboundMessage) -> None:
+        if self._should_send_voice(outbound):
+            self._send_text_to_speech(outbound)
+            return
         try:
             self._api.send_message(
                 chat_id=outbound.chat_id,
@@ -99,6 +118,113 @@ class TelegramChannelAdapter(ChannelAdapterPort):
         diagnostics = list(self._diagnostics)
         self._diagnostics.clear()
         return diagnostics
+
+    def _should_send_voice(self, outbound: OutboundMessage) -> bool:
+        metadata = outbound.metadata if isinstance(outbound.metadata, dict) else {}
+        tts = metadata.get("telegram_tts")
+        return bool(isinstance(tts, dict) and tts.get("enabled"))
+
+    def _send_text_to_speech(self, outbound: OutboundMessage) -> None:
+        processor = self._text_to_speech_processor
+        if processor is None:
+            self._send_text_fallback(outbound)
+            return
+        try:
+            synthesized = processor.synthesize(outbound)
+        except TextToSpeechSynthesisError as exc:
+            self._record_diagnostic(code=exc.code, message=exc.detail)
+            self._send_text_fallback(outbound)
+            return
+
+        try:
+            self._api.send_voice(
+                chat_id=outbound.chat_id,
+                voice_bytes=synthesized.audio_bytes,
+                filename=synthesized.filename,
+                reply_to_message_id=outbound.reply_to_message_id,
+                caption=synthesized.caption,
+            )
+        except TelegramApiError as exc:
+            if self._should_fallback_from_voice_send(exc):
+                self._record_diagnostic(
+                    code="tts-voice-send-fallback",
+                    message=str(exc),
+                )
+                self._send_text_fallback(outbound)
+                return
+            raise ChannelRuntimeError(f"send_voice failed: {exc.to_dict()}") from exc
+
+    def _send_text_fallback(self, outbound: OutboundMessage) -> None:
+        fallback_text = self._resolve_tts_fallback_text(outbound)
+        try:
+            self._api.send_message(
+                chat_id=outbound.chat_id,
+                text=fallback_text,
+                reply_to_message_id=outbound.reply_to_message_id,
+            )
+        except TelegramApiError as exc:
+            raise ChannelRuntimeError(f"send_message failed: {exc.to_dict()}") from exc
+
+    def _resolve_tts_fallback_text(self, outbound: OutboundMessage) -> str:
+        metadata = outbound.metadata if isinstance(outbound.metadata, dict) else {}
+        tts = metadata.get("telegram_tts")
+        if isinstance(tts, dict):
+            fallback_text = str(tts.get("fallback_text", "")).strip()
+            if fallback_text:
+                return fallback_text
+        return outbound.text
+
+    def _should_fallback_from_voice_send(self, exc: TelegramApiError) -> bool:
+        if exc.retry_class in {"transient", "rate-limit"}:
+            return False
+        if exc.transient:
+            return False
+        return True
+
+    def _is_voice_note(self, inbound: InboundMessage) -> bool:
+        metadata = inbound.metadata if isinstance(inbound.metadata, dict) else {}
+        return metadata.get("content_type") == "voice"
+
+    def _resolve_voice_note(self, *, update_id: int, inbound: InboundMessage) -> InboundMessage | None:
+        processor = self._voice_note_processor
+        if processor is None or not processor.enabled:
+            self._send_voice_note_reply(
+                inbound,
+                "I received your voice note, but voice-note handling is not enabled on this host yet. Please send text for now.",
+            )
+            self._record_diagnostic(
+                code="voice-note-disabled",
+                update_id=update_id,
+                message="voice note received but no processor is configured",
+            )
+            return None
+
+        try:
+            enriched = processor.transcribe(inbound)
+        except VoiceNoteProcessingError as exc:
+            self._send_voice_note_reply(inbound, exc.user_message)
+            self._record_diagnostic(code=exc.code, update_id=update_id, message=exc.detail)
+            return None
+        self._record_diagnostic(
+            code="voice-note-transcribed",
+            update_id=update_id,
+            message="voice note transcribed into inbound text",
+        )
+        return enriched
+
+    def _send_voice_note_reply(self, inbound: InboundMessage, text: str) -> None:
+        try:
+            self._api.send_message(
+                chat_id=inbound.chat_id,
+                text=text,
+                reply_to_message_id=inbound.message_id,
+            )
+        except TelegramApiError as exc:
+            self._record_diagnostic(
+                code="voice-note-reply-failed",
+                update_id=_to_int_update_id(inbound.update_id),
+                message=str(exc),
+            )
 
     def _recompute_offset(self) -> None:
         if self._pending_ack_ids:
@@ -157,7 +283,6 @@ class TelegramChannelAdapter(ChannelAdapterPort):
         if update_id is not None:
             payload["update_id"] = str(update_id)
         self._diagnostics.append(payload)
-
 
 def _to_int_update_id(value: Any) -> int | None:
     try:

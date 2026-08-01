@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
 import subprocess
 import time
+from urllib.parse import urlsplit, urlunsplit
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from channel_core.contracts import ContractValidationError, InboundMessage, OutboundMessage
 from channel_runtime.config import DURABLE_CONTEXT_MODE, LEGACY_CONTEXT_EMERGENCY_TOGGLE, LEGACY_CONTEXT_MODE
@@ -15,6 +18,15 @@ from channel_runtime.context.contracts import ContextStorePort, ContextTurn
 from channel_runtime.context.errors import ContextSubsystemError
 from channel_runtime.context.store import ContextStore
 from channel_runtime.context.token_estimator import TokenEstimator
+from channel_runtime.acquisition import AcquisitionDispatcherError
+from channel_runtime import acquisition_helper
+from channel_runtime.youtube_transcript import (
+    YouTubeTranscriptError,
+    extract_first_youtube_url,
+    extract_video_id,
+    maybe_enrich_message_with_youtube_transcript,
+)
+from channel_runtime.dinner_selector import build_dinner_command_response
 
 ConversationTurn = dict[str, str | None]
 _OVERFLOW_ERROR_SIGNATURES = (
@@ -27,6 +39,45 @@ _OVERFLOW_ERROR_SIGNATURES = (
 )
 _OPERATOR_INSPECT_COMMANDS = frozenset({"/ctx inspect", "/context inspect"})
 _OPERATOR_COMPACT_COMMANDS = frozenset({"/ctx compact", "/context compact"})
+_OPERATOR_RUNTIME_ENV_COMMANDS = frozenset({"/runtime env"})
+_OPERATOR_RUNTIME_YOUTUBE_PROBE_PREFIXES = frozenset({"/runtime youtube-probe ", "/runtime youtube probe "})
+_TTS_COMMAND_PREFIXES = ("/speak ", "/tts ")
+_TTS_COMMANDS = frozenset({"/speak", "/tts"})
+_RUNTIME_ENV_ALLOWLIST = (
+    "AGENT_SKILLS_ENV_FILE",
+    "PYTHONPATH",
+    "CHANNEL_ACQUISITION_MODE",
+    "CHANNEL_ACQUISITION_ALLOWED_JOB_TYPES",
+    "CHANNEL_ACQUISITION_ARTIFACT_DIR",
+    "CHANNEL_ACQUISITION_COMMAND",
+    "CHANNEL_RUNTIME_CMD",
+    "CHANNEL_RUNTIME_DNS_PREFLIGHT",
+    "CHANNEL_RUNTIME_DNS_PREFLIGHT_HOSTS",
+    "CHANNEL_RUNTIME_DNS_PREFLIGHT_PORT",
+    "CHANNEL_RUNTIME_LOG_FILE",
+    "CHANNEL_RUNTIME_PID_FILE",
+    "CHANNEL_RUNTIME_PROCESS_MATCH",
+    "CHANNEL_RUNTIME_PYTHON_BIN",
+    "CHANNEL_RUNTIME_STARTUP_WAIT_S",
+    "CHANNEL_RUNTIME_STOP_WAIT_S",
+    "CHANNEL_CODEX_SANDBOX_MODE",
+    "CHANNEL_CODEX_DEFAULT_PERMISSIONS",
+    "CHANNEL_CODEX_SEARCH",
+    "CHANNEL_CODEX_PROFILE",
+    "ALL_PROXY",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "all_proxy",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+)
+_YOUTUBE_PROBE_HOSTS = ("www.youtube.com", "youtube.com", "youtu.be")
+_CODEX_SANDBOX_MODES = frozenset({"read-only", "workspace-write"})
+_CODEX_OMIT_SANDBOX_VALUES = frozenset({"", "config-default", "default", "none", "omit"})
+_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+_FALSE_VALUES = frozenset({"0", "false", "no", "off", ""})
 
 
 @dataclass(frozen=True)
@@ -289,18 +340,29 @@ class CodexOrchestrator:
         timeout_s: float = 20.0,
         notify_on_error: bool = False,
         invoke_fn: Callable[[CodexInvocationRequest], str | None] | None = None,
+        youtube_transcript_fetcher: Callable[[str], Any] | None = None,
+        message_preparer: Callable[[str], str] | None = None,
         session_manager: CodexSessionManager | None = None,
+        env_provider: Mapping[str, str] | None = None,
+        runtime_env_log_path: str | Path = "artifacts/channel_runtime/runtime_env_diagnostics.log",
+        runtime_youtube_probe_log_path: str | Path = "artifacts/channel_runtime/youtube_probe_diagnostics.log",
         context_mode: str = LEGACY_CONTEXT_MODE,
         context_store: ContextStorePort | None = None,
         context_assembler: ContextAssembler | None = None,
         compaction_service: CompactionService | None = None,
         compaction_policy: CompactionPolicy | None = None,
         enable_context_operator_controls: bool = False,
+        meal_options_path: str = "data/meal_options.json",
     ) -> None:
         self._timeout_s = float(timeout_s)
         self._notify_on_error = bool(notify_on_error)
         self._invoke_fn = invoke_fn or (lambda req: _default_codex_invoke(req, timeout_s=self._timeout_s))
+        self._youtube_transcript_fetcher = youtube_transcript_fetcher
+        self._message_preparer = message_preparer
         self._session_manager = session_manager or CodexSessionManager()
+        self._env_provider = env_provider if env_provider is not None else os.environ
+        self._runtime_env_log_path = Path(runtime_env_log_path)
+        self._runtime_youtube_probe_log_path = Path(runtime_youtube_probe_log_path)
         self._context_mode = str(context_mode).strip().lower()
         if self._context_mode not in {LEGACY_CONTEXT_MODE, DURABLE_CONTEXT_MODE}:
             raise ValueError(
@@ -331,20 +393,49 @@ class CodexOrchestrator:
         self._context_telemetry = _ContextTelemetryState(mode=self._context_mode)
         self._diagnostics: list[dict[str, Any]] = []
         self._enable_context_operator_controls = bool(enable_context_operator_controls)
+        self._meal_options_path = str(meal_options_path).strip() or "data/meal_options.json"
 
     def handle_message(self, inbound: InboundMessage, *, session_id: str) -> OutboundMessage | None:
+        tts_response = _build_tts_command_response(inbound=inbound, session_id=session_id)
+        if tts_response is not None:
+            return tts_response
+        dinner_response = build_dinner_command_response(
+            inbound=inbound,
+            session_id=session_id,
+            meal_options_path=self._meal_options_path,
+            orchestrator_mode="codex",
+        )
+        if dinner_response is not None:
+            return dinner_response
         if self._enable_context_operator_controls:
             operator_response = self._handle_operator_context_command(inbound=inbound, session_id=session_id)
             if operator_response is not None:
                 return operator_response
         self._session_manager.begin(session_id)
         try:
+            if self._message_preparer is not None:
+                prepared_user_text = self._message_preparer(inbound.text)
+            else:
+                prepared_user_text = maybe_enrich_message_with_youtube_transcript(
+                    inbound.text,
+                    fetcher=self._youtube_transcript_fetcher,
+                )
             history = self._conversation_history_for_request(session_id=session_id)
             request = CodexInvocationRequest.from_inbound(
                 inbound,
                 session_id=session_id,
                 conversation_history=history,
             )
+            if prepared_user_text != inbound.text:
+                request = CodexInvocationRequest(
+                    session_id=request.session_id,
+                    chat_id=request.chat_id,
+                    user_id=request.user_id,
+                    text=prepared_user_text,
+                    update_id=request.update_id,
+                    message_id=request.message_id,
+                    conversation_history=request.conversation_history,
+                )
             response_text = self._invoke_with_overflow_recovery(
                 request=request,
                 inbound=inbound,
@@ -383,6 +474,58 @@ class CodexOrchestrator:
                 text=text,
                 reply_to_message_id=inbound.message_id,
                 metadata={"session_id": session_id, "orchestrator_mode": "codex"},
+            )
+        except YouTubeTranscriptError as exc:
+            text = exc.user_message
+            self._record_conversation_turn(
+                session_id=session_id,
+                user_text=inbound.text,
+                assistant_text=text,
+            )
+            self._session_manager.record_success(session_id)
+            return OutboundMessage(
+                chat_id=inbound.chat_id,
+                text=text,
+                reply_to_message_id=inbound.message_id,
+                metadata={
+                    "session_id": session_id,
+                    "orchestrator_mode": "codex",
+                    "fallback": "youtube-transcript-error",
+                    "error_code": exc.code,
+                },
+            )
+        except AcquisitionDispatcherError as exc:
+            text = exc.user_message
+            self._diagnostics.append(
+                {
+                    "code": exc.code,
+                    "update_id": inbound.update_id,
+                    "session_id": session_id,
+                    "retryable": False,
+                    "layer": "acquisition",
+                    "operation": "prepare-message",
+                    "message": exc.detail,
+                    "acquisition": dict(exc.metadata),
+                }
+            )
+            self._record_conversation_turn(
+                session_id=session_id,
+                user_text=inbound.text,
+                assistant_text=text,
+            )
+            self._session_manager.record_success(session_id)
+            return OutboundMessage(
+                chat_id=inbound.chat_id,
+                text=text,
+                reply_to_message_id=inbound.message_id,
+                metadata={
+                    "session_id": session_id,
+                    "orchestrator_mode": "codex",
+                    "fallback": "acquisition-dispatcher-error",
+                    "error_code": exc.code,
+                    "error_detail": exc.detail,
+                    "error_metadata": dict(exc.metadata),
+                },
             )
         except Exception as exc:
             code, retryable, track_as_timeout = _classify_codex_exception(exc)
@@ -665,43 +808,180 @@ class CodexOrchestrator:
         try:
             if command == "inspect":
                 result = self.inspect_session_context(session_id=session_id)
-            else:
-                result = self.run_manual_compaction(session_id=session_id)
-            text = _format_operator_context_report(command=command, result=result)
-            return OutboundMessage(
-                chat_id=inbound.chat_id,
-                text=text,
-                reply_to_message_id=inbound.message_id,
-                metadata={
+                text = _format_operator_context_report(command=command, result=result)
+                metadata = {
                     "session_id": session_id,
                     "orchestrator_mode": "codex",
                     "operator_command": f"context-{command}",
                     "operator_status": str(result.get("status", "")).strip().lower(),
-                },
+                }
+            elif command == "compact":
+                result = self.run_manual_compaction(session_id=session_id)
+                text = _format_operator_context_report(command=command, result=result)
+                metadata = {
+                    "session_id": session_id,
+                    "orchestrator_mode": "codex",
+                    "operator_command": f"context-{command}",
+                    "operator_status": str(result.get("status", "")).strip().lower(),
+                }
+            elif command == "runtime-youtube-probe":
+                source_url = extract_first_youtube_url(inbound.text)
+                result = self.capture_runtime_youtube_probe(
+                    session_id=session_id,
+                    update_id=inbound.update_id,
+                    source_url=source_url or "",
+                )
+                text = _format_runtime_youtube_probe_report(result=result)
+                metadata = {
+                    "session_id": session_id,
+                    "orchestrator_mode": "codex",
+                    "operator_command": "runtime-youtube-probe",
+                    "operator_status": str(result.get("status", "")).strip().lower(),
+                    "probe_code": str(result.get("probe_code", "")).strip(),
+                    "log_path": str(result.get("log_path", "")).strip(),
+                }
+            else:
+                result = self.capture_runtime_env_snapshot(session_id=session_id, update_id=inbound.update_id)
+                text = _format_runtime_env_report(result=result)
+                metadata = {
+                    "session_id": session_id,
+                    "orchestrator_mode": "codex",
+                    "operator_command": "runtime-env",
+                    "operator_status": str(result.get("status", "")).strip().lower(),
+                    "log_path": str(result.get("log_path", "")).strip(),
+                }
+            return OutboundMessage(
+                chat_id=inbound.chat_id,
+                text=text,
+                reply_to_message_id=inbound.message_id,
+                metadata=metadata,
             )
         except Exception as exc:
             self._diagnostics.append(
                 {
-                    "code": "context-operator-command-error",
+                    "code": (
+                        "runtime-operator-command-error"
+                        if command in {"runtime-env", "runtime-youtube-probe"}
+                        else "context-operator-command-error"
+                    ),
                     "update_id": inbound.update_id,
                     "session_id": session_id,
                     "retryable": False,
-                    "layer": "context",
+                    "layer": "runtime" if command in {"runtime-env", "runtime-youtube-probe"} else "context",
                     "operation": command,
                     "message": _sanitize_exception(exc),
                 }
             )
             return OutboundMessage(
                 chat_id=inbound.chat_id,
-                text=f"context {command}: status=failed reason=internal-error",
+                text=(
+                    "runtime env: status=failed reason=internal-error"
+                    if command == "runtime-env"
+                    else (
+                        "runtime youtube-probe: status=failed reason=internal-error"
+                        if command == "runtime-youtube-probe"
+                        else f"context {command}: status=failed reason=internal-error"
+                    )
+                ),
                 reply_to_message_id=inbound.message_id,
                 metadata={
                     "session_id": session_id,
                     "orchestrator_mode": "codex",
-                    "operator_command": f"context-{command}",
+                    "operator_command": (
+                        "runtime-env"
+                        if command == "runtime-env"
+                        else ("runtime-youtube-probe" if command == "runtime-youtube-probe" else f"context-{command}")
+                    ),
                     "operator_status": "failed",
                 },
             )
+
+    def capture_runtime_env_snapshot(self, *, session_id: str, update_id: str) -> dict[str, Any]:
+        snapshot = {
+            "captured_at_epoch_s": int(time.time()),
+            "session_id": _normalize_non_empty_text(session_id),
+            "update_id": str(update_id).strip(),
+            "pid": os.getpid(),
+            "cwd": str(Path.cwd()),
+            "env": _collect_allowlisted_env(self._env_provider),
+        }
+        log_path = self._runtime_env_log_path
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(snapshot, sort_keys=True) + "\n")
+        set_count = sum(1 for item in snapshot["env"] if item.get("is_set"))
+        return {
+            "status": "ok",
+            "reason": "snapshot-written",
+            "log_path": str(log_path),
+            "env_key_count": len(snapshot["env"]),
+            "env_key_set_count": set_count,
+        }
+
+    def capture_runtime_youtube_probe(self, *, session_id: str, update_id: str, source_url: str) -> dict[str, Any]:
+        normalized_source_url = str(source_url).strip()
+        snapshot: dict[str, Any] = {
+            "captured_at_epoch_s": int(time.time()),
+            "session_id": _normalize_non_empty_text(session_id),
+            "update_id": str(update_id).strip(),
+            "pid": os.getpid(),
+            "cwd": str(Path.cwd()),
+            "source_url": normalized_source_url,
+            "video_id": extract_video_id(normalized_source_url),
+            "dns": _resolve_probe_hosts(_YOUTUBE_PROBE_HOSTS),
+        }
+        if not normalized_source_url:
+            snapshot["status"] = "failed"
+            snapshot["error"] = {
+                "code": "missing-source-url",
+                "detail": "runtime youtube probe requires a YouTube URL in the command text",
+            }
+        else:
+            try:
+                response = acquisition_helper.build_response(
+                    {
+                        "job_type": "youtube-transcript",
+                        "source_url": normalized_source_url,
+                    }
+                )
+                artifact = response.get("artifact", {}) if isinstance(response, Mapping) else {}
+                transcript_text = str(artifact.get("transcript_text", ""))
+                snapshot["status"] = "ok"
+                snapshot["probe_code"] = "transcript-fetched"
+                snapshot["artifact"] = {
+                    "video_id": str(artifact.get("video_id", "")).strip(),
+                    "language_code": str(artifact.get("language_code", "")).strip(),
+                    "segment_count": int(artifact.get("segment_count", 0)),
+                    "truncated": bool(artifact.get("truncated", False)),
+                    "transcript_chars": len(transcript_text),
+                }
+            except YouTubeTranscriptError as exc:
+                snapshot["status"] = "failed"
+                snapshot["probe_code"] = exc.code
+                snapshot["error"] = {
+                    "code": exc.code,
+                    "detail": str(exc),
+                    "user_message": exc.user_message,
+                }
+            except Exception as exc:
+                snapshot["status"] = "failed"
+                snapshot["probe_code"] = "runtime-youtube-probe-unexpected-error"
+                snapshot["error"] = {
+                    "code": "runtime-youtube-probe-unexpected-error",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                }
+        log_path = self._runtime_youtube_probe_log_path
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(snapshot, sort_keys=True) + "\n")
+        return {
+            "status": str(snapshot.get("status", "failed")).strip().lower(),
+            "reason": "probe-written",
+            "probe_code": str(snapshot.get("probe_code") or snapshot.get("error", {}).get("code", "")).strip(),
+            "video_id": str(snapshot.get("video_id") or "").strip(),
+            "dns_failures": sum(1 for item in snapshot.get("dns", ()) if item.get("status") != "ok"),
+            "log_path": str(log_path),
+        }
 
     def inspect_session_context(self, *, session_id: str) -> dict[str, Any]:
         normalized_session_id = _normalize_non_empty_text(session_id)
@@ -815,16 +1095,7 @@ def _default_codex_invoke(request: CodexInvocationRequest, *, timeout_s: float) 
     )
     try:
         completed = subprocess.run(
-            [
-                "codex",
-                "exec",
-                "--sandbox",
-                "workspace-write",
-                "--skip-git-repo-check",
-                "--cd",
-                codex_cwd,
-                payload,
-            ],
+            _build_codex_exec_args(codex_cwd=codex_cwd, payload=payload, env=os.environ),
             capture_output=True,
             text=True,
             timeout=timeout_s,
@@ -839,6 +1110,113 @@ def _default_codex_invoke(request: CodexInvocationRequest, *, timeout_s: float) 
         raise CodexExecError(stderr)
     output = (completed.stdout or "").strip()
     return output or None
+
+
+def _build_codex_exec_args(*, codex_cwd: str, payload: str, env: Mapping[str, str]) -> list[str]:
+    args = ["codex"]
+    if _parse_env_bool(env.get("CHANNEL_CODEX_SEARCH"), default=False, field_name="CHANNEL_CODEX_SEARCH"):
+        args.append("--search")
+    args.append("exec")
+
+    profile = str(env.get("CHANNEL_CODEX_PROFILE", "")).strip()
+    if profile:
+        args.extend(["--profile", profile])
+
+    default_permissions = str(env.get("CHANNEL_CODEX_DEFAULT_PERMISSIONS", "")).strip()
+    if default_permissions:
+        args.extend(["-c", f"default_permissions={json.dumps(default_permissions)}"])
+
+    sandbox_mode = _codex_sandbox_mode(env.get("CHANNEL_CODEX_SANDBOX_MODE"))
+    if sandbox_mode is not None:
+        args.extend(["--sandbox", sandbox_mode])
+
+    args.extend(["--skip-git-repo-check", "--cd", codex_cwd, payload])
+    return args
+
+
+def _codex_sandbox_mode(raw_value: str | None) -> str | None:
+    if raw_value is None:
+        return "workspace-write"
+    value = str(raw_value).strip()
+    normalized = value.lower()
+    if normalized in _CODEX_OMIT_SANDBOX_VALUES:
+        return None
+    if normalized not in _CODEX_SANDBOX_MODES:
+        allowed = ", ".join(sorted(_CODEX_SANDBOX_MODES))
+        raise CodexExecError(
+            f"Invalid CHANNEL_CODEX_SANDBOX_MODE={value!r}; use {allowed}, or config-default to omit --sandbox"
+        )
+    return normalized
+
+
+def _parse_env_bool(raw_value: str | None, *, default: bool, field_name: str) -> bool:
+    if raw_value is None:
+        return default
+    value = str(raw_value).strip().lower()
+    if value in _TRUE_VALUES:
+        return True
+    if value in _FALSE_VALUES:
+        return False
+    raise CodexExecError(f"Invalid {field_name}={raw_value!r}; expected a boolean value")
+
+
+def _collect_allowlisted_env(env: Mapping[str, str]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for key in _RUNTIME_ENV_ALLOWLIST:
+        raw_value = env.get(key)
+        value = str(raw_value) if raw_value is not None else ""
+        rows.append(
+            {
+                "key": key,
+                "is_set": raw_value is not None,
+                "value": _truncate_env_value(_redact_env_value(key=key, value=value)) if raw_value is not None else "",
+            }
+        )
+    return rows
+
+
+def _redact_env_value(*, key: str, value: str) -> str:
+    normalized_key = str(key).strip().lower()
+    if normalized_key.endswith("_proxy") or normalized_key in {"all_proxy", "http_proxy", "https_proxy", "no_proxy"}:
+        return _redact_proxy_url(value)
+    return value
+
+
+def _redact_proxy_url(value: str) -> str:
+    compact = str(value).strip()
+    if "@" not in compact or "://" not in compact:
+        return value
+    try:
+        parsed = urlsplit(compact)
+    except ValueError:
+        return "<redacted-proxy-url>"
+    if "@" not in parsed.netloc:
+        return value
+    host = parsed.hostname or ""
+    if not host:
+        return "<redacted-proxy-url>"
+    netloc = f"<redacted>@{host}"
+    if parsed.port is not None:
+        netloc = f"{netloc}:{parsed.port}"
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+
+def _resolve_probe_hosts(hosts: tuple[str, ...], *, port: int = 443) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for host in hosts:
+        try:
+            resolved = socket.getaddrinfo(host, port)[0][4]
+            rows.append({"host": host, "status": "ok", "resolved": list(resolved)})
+        except Exception as exc:
+            rows.append({"host": host, "status": "failed", "error": f"{type(exc).__name__}: {exc}"})
+    return rows
+
+
+def _truncate_env_value(value: str, *, limit: int = 240) -> str:
+    compact = " ".join(str(value).split())
+    if len(compact) <= limit:
+        return compact
+    return f"{compact[: max(0, limit - 3)]}..."
 
 
 def _classify_codex_exception(exc: Exception) -> tuple[str, bool, bool]:
@@ -919,6 +1297,10 @@ def _parse_operator_context_command(text: str) -> str | None:
         return "inspect"
     if normalized in _OPERATOR_COMPACT_COMMANDS:
         return "compact"
+    if normalized in _OPERATOR_RUNTIME_ENV_COMMANDS:
+        return "runtime-env"
+    if any(normalized.startswith(prefix.strip()) for prefix in _OPERATOR_RUNTIME_YOUTUBE_PROBE_PREFIXES):
+        return "runtime-youtube-probe"
     return None
 
 
@@ -975,3 +1357,65 @@ def _format_operator_context_report(*, command: str, result: dict[str, Any]) -> 
         f" turns_before={result['turns_before']}"
         f" turns_after={result['turns_after']}"
     )
+
+
+def _format_runtime_env_report(*, result: dict[str, Any]) -> str:
+    return (
+        "runtime env:"
+        f" status={result['status']}"
+        f" reason={result['reason']}"
+        f" env_keys={result['env_key_count']}"
+        f" env_keys_set={result['env_key_set_count']}"
+        f" log_path={result['log_path']}"
+    )
+
+
+def _format_runtime_youtube_probe_report(*, result: dict[str, Any]) -> str:
+    return (
+        "runtime youtube-probe:"
+        f" status={result['status']}"
+        f" reason={result['reason']}"
+        f" probe_code={result['probe_code']}"
+        f" video_id={result['video_id'] or 'unknown'}"
+        f" dns_failures={result['dns_failures']}"
+        f" log_path={result['log_path']}"
+    )
+
+
+def _build_tts_command_response(*, inbound: InboundMessage, session_id: str) -> OutboundMessage | None:
+    command_text = str(inbound.text).strip()
+    if not command_text:
+        return None
+    normalized = command_text.lower()
+    if normalized in _TTS_COMMANDS:
+        return OutboundMessage(
+            chat_id=inbound.chat_id,
+            text="Usage: /speak <text> or /tts <text>",
+            reply_to_message_id=inbound.message_id,
+            metadata={"session_id": session_id, "orchestrator_mode": "codex"},
+        )
+    for prefix in _TTS_COMMAND_PREFIXES:
+        if normalized.startswith(prefix):
+            spoken_text = command_text[len(prefix) :].strip()
+            if not spoken_text:
+                return OutboundMessage(
+                    chat_id=inbound.chat_id,
+                    text="Usage: /speak <text> or /tts <text>",
+                    reply_to_message_id=inbound.message_id,
+                    metadata={"session_id": session_id, "orchestrator_mode": "codex"},
+                )
+            return OutboundMessage(
+                chat_id=inbound.chat_id,
+                text=spoken_text,
+                reply_to_message_id=inbound.message_id,
+                metadata={
+                    "session_id": session_id,
+                    "orchestrator_mode": "codex",
+                    "telegram_tts": {
+                        "enabled": True,
+                        "text": spoken_text,
+                        "fallback_text": spoken_text,
+                    },
+                },
+            )
+    return None

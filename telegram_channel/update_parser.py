@@ -16,7 +16,7 @@ class ParsedTelegramUpdate:
 
 
 def parse_update(raw_update: Mapping[str, Any]) -> ParsedTelegramUpdate:
-    """Parse only message.text updates; safely skip all unsupported payloads."""
+    """Parse text messages and normalize Telegram voice notes into inbound metadata."""
     update_id = _coerce_required_id(raw_update.get("update_id"))
     if update_id is None:
         return ParsedTelegramUpdate(update_id=None, inbound=None, skip_reason="invalid-update-id")
@@ -25,10 +25,6 @@ def parse_update(raw_update: Mapping[str, Any]) -> ParsedTelegramUpdate:
     if not isinstance(message, Mapping):
         return ParsedTelegramUpdate(update_id=update_id, inbound=None, skip_reason="unsupported-update-type")
 
-    text = message.get("text")
-    if not isinstance(text, str) or not text.strip():
-        return ParsedTelegramUpdate(update_id=update_id, inbound=None, skip_reason="unsupported-message-text")
-
     chat = message.get("chat")
     sender = message.get("from")
     chat_id = _coerce_required_id(chat.get("id") if isinstance(chat, Mapping) else None)
@@ -36,14 +32,36 @@ def parse_update(raw_update: Mapping[str, Any]) -> ParsedTelegramUpdate:
     if chat_id is None or user_id is None:
         return ParsedTelegramUpdate(update_id=update_id, inbound=None, skip_reason="missing-chat-or-user-id")
 
+    text = message.get("text")
+    metadata: dict[str, Any] = {"source": "telegram", "update_type": "message", "content_type": "text"}
+    inbound_text = text
+    if not isinstance(text, str) or not text.strip():
+        voice = message.get("voice")
+        if not isinstance(voice, Mapping):
+            return ParsedTelegramUpdate(update_id=update_id, inbound=None, skip_reason="unsupported-message-text")
+
+        file_id = _coerce_required_id(voice.get("file_id"))
+        if file_id is None:
+            return ParsedTelegramUpdate(update_id=update_id, inbound=None, skip_reason="unsupported-message-voice")
+
+        inbound_text = "[Voice note]"
+        metadata["content_type"] = "voice"
+        metadata["telegram_voice"] = {
+            "file_id": file_id,
+            "file_unique_id": _coerce_optional_id(voice.get("file_unique_id")),
+            "duration_s": _coerce_optional_int(voice.get("duration")),
+            "mime_type": _coerce_optional_id(voice.get("mime_type")),
+            "file_size": _coerce_optional_int(voice.get("file_size")),
+        }
+
     inbound = InboundMessage(
         update_id=update_id,
         chat_id=chat_id,
         user_id=user_id,
-        text=text,
+        text=str(inbound_text),
         message_id=_coerce_optional_id(message.get("message_id")),
         timestamp_s=_coerce_optional_int(message.get("date")),
-        metadata={"source": "telegram", "update_type": "message"},
+        metadata=metadata,
     )
     return ParsedTelegramUpdate(update_id=update_id, inbound=inbound, skip_reason=None)
 

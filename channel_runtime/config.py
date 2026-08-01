@@ -38,6 +38,25 @@ class RuntimeConfig:
     context_compaction_cooldown_s: float = 300.0
     context_strict_io: bool = False
     context_manual_compact: bool = False
+    voice_notes_enabled: bool = True
+    voice_note_whisper_command: str = "whisper"
+    voice_note_whisper_model: str = "turbo"
+    voice_note_language: str | None = None
+    voice_note_transcribe_timeout_s: float = 120.0
+    voice_note_max_chars: int = 4000
+    voice_note_temp_dir: str = ".channel_runtime/voice_notes"
+    tts_enabled: bool = False
+    tts_command: str = ""
+    tts_timeout_s: float = 30.0
+    tts_max_chars: int = 2000
+    tts_temp_dir: str = ".channel_runtime/tts"
+    tts_voice: str | None = None
+    tts_language: str | None = None
+    meal_options_path: str = "data/meal_options.json"
+    acquisition_mode: str = "inline"
+    acquisition_allowed_job_types: tuple[str, ...] = ("youtube-transcript",)
+    acquisition_artifact_dir: str = ".channel_runtime/acquisitions"
+    acquisition_command: str = ""
 
     def __post_init__(self) -> None:
         token = str(self.token).strip()
@@ -45,6 +64,7 @@ class RuntimeConfig:
         ack_policy = str(self.ack_policy).strip().lower()
         orchestrator_mode = str(self.orchestrator_mode).strip()
         context_mode = str(self.context_mode).strip().lower()
+        acquisition_mode = str(self.acquisition_mode).strip().lower()
 
         if not token:
             raise ConfigValidationError("token must be a non-empty string")
@@ -54,6 +74,8 @@ class RuntimeConfig:
             raise ConfigValidationError("ack_policy must be 'always' or 'on-success'")
         if orchestrator_mode not in {"default", "codex"}:
             raise ConfigValidationError("orchestrator_mode must be 'default' or 'codex'")
+        if acquisition_mode not in {"disabled", "inline", "command"}:
+            raise ConfigValidationError("acquisition_mode must be 'disabled', 'inline', or 'command'")
         if context_mode not in {LEGACY_CONTEXT_MODE, DURABLE_CONTEXT_MODE}:
             raise ConfigValidationError(
                 "context_mode must be 'legacy' or 'durable' "
@@ -79,6 +101,14 @@ class RuntimeConfig:
             raise ConfigValidationError("context_min_gain_tokens must be an integer >= 0")
         if float(self.context_compaction_cooldown_s) < 0:
             raise ConfigValidationError("context_compaction_cooldown_s must be a number >= 0")
+        if float(self.voice_note_transcribe_timeout_s) <= 0:
+            raise ConfigValidationError("voice_note_transcribe_timeout_s must be a positive number")
+        if int(self.voice_note_max_chars) < 1:
+            raise ConfigValidationError("voice_note_max_chars must be an integer >= 1")
+        if float(self.tts_timeout_s) <= 0:
+            raise ConfigValidationError("tts_timeout_s must be a positive number")
+        if int(self.tts_max_chars) < 1:
+            raise ConfigValidationError("tts_max_chars must be an integer >= 1")
         if int(self.context_window_tokens) <= int(self.context_reserve_tokens):
             raise ConfigValidationError("context_window_tokens must be greater than context_reserve_tokens")
         for chat_id in self.allowed_chat_ids:
@@ -87,6 +117,9 @@ class RuntimeConfig:
         for chat_id in self.context_canary_chat_ids:
             if not str(chat_id).strip():
                 raise ConfigValidationError("context_canary_chat_ids must not contain empty values")
+        for job_type in self.acquisition_allowed_job_types:
+            if not str(job_type).strip():
+                raise ConfigValidationError("acquisition_allowed_job_types must not contain empty values")
         if self.live_mode and not self.allowed_chat_ids:
             raise ConfigValidationError("allowed_chat_ids must be non-empty when live_mode is enabled")
 
@@ -95,6 +128,7 @@ class RuntimeConfig:
         object.__setattr__(self, "ack_policy", ack_policy)
         object.__setattr__(self, "orchestrator_mode", orchestrator_mode)
         object.__setattr__(self, "context_mode", context_mode)
+        object.__setattr__(self, "acquisition_mode", acquisition_mode)
 
 
 def parse_runtime_config(
@@ -134,6 +168,25 @@ def parse_runtime_config(
         "context_compaction_cooldown_s": source_env.get("CHANNEL_CONTEXT_COMPACTION_COOLDOWN_S", "300"),
         "context_strict_io": source_env.get("CHANNEL_CONTEXT_STRICT_IO", "false"),
         "context_manual_compact": source_env.get("CHANNEL_CONTEXT_MANUAL_COMPACT", "false"),
+        "voice_notes_enabled": source_env.get("CHANNEL_VOICE_NOTES_ENABLED", "true"),
+        "voice_note_whisper_command": source_env.get("CHANNEL_VOICE_NOTE_WHISPER_COMMAND", "whisper"),
+        "voice_note_whisper_model": source_env.get("CHANNEL_VOICE_NOTE_WHISPER_MODEL", "turbo"),
+        "voice_note_language": source_env.get("CHANNEL_VOICE_NOTE_LANGUAGE", ""),
+        "voice_note_transcribe_timeout_s": source_env.get("CHANNEL_VOICE_NOTE_TRANSCRIBE_TIMEOUT_S", "120"),
+        "voice_note_max_chars": source_env.get("CHANNEL_VOICE_NOTE_MAX_CHARS", "4000"),
+        "voice_note_temp_dir": source_env.get("CHANNEL_VOICE_NOTE_TEMP_DIR", ".channel_runtime/voice_notes"),
+        "tts_enabled": source_env.get("CHANNEL_TTS_ENABLED", "false"),
+        "tts_command": source_env.get("CHANNEL_TTS_COMMAND", ""),
+        "tts_timeout_s": source_env.get("CHANNEL_TTS_TIMEOUT_S", "30"),
+        "tts_max_chars": source_env.get("CHANNEL_TTS_MAX_CHARS", "2000"),
+        "tts_temp_dir": source_env.get("CHANNEL_TTS_TEMP_DIR", ".channel_runtime/tts"),
+        "tts_voice": source_env.get("CHANNEL_TTS_VOICE", ""),
+        "tts_language": source_env.get("CHANNEL_TTS_LANGUAGE", ""),
+        "meal_options_path": source_env.get("CHANNEL_MEAL_OPTIONS_PATH", "data/meal_options.json"),
+        "acquisition_mode": source_env.get("CHANNEL_ACQUISITION_MODE", "inline"),
+        "acquisition_allowed_job_types": source_env.get("CHANNEL_ACQUISITION_ALLOWED_JOB_TYPES", "youtube-transcript"),
+        "acquisition_artifact_dir": source_env.get("CHANNEL_ACQUISITION_ARTIFACT_DIR", ".channel_runtime/acquisitions"),
+        "acquisition_command": source_env.get("CHANNEL_ACQUISITION_COMMAND", ""),
     }
 
     _apply_cli_overrides(values, args)
@@ -184,6 +237,15 @@ def parse_runtime_config(
     )
     context_strict_io = _parse_bool(values["context_strict_io"], field_name="context_strict_io")
     context_manual_compact = _parse_bool(values["context_manual_compact"], field_name="context_manual_compact")
+    voice_notes_enabled = _parse_bool(values["voice_notes_enabled"], field_name="voice_notes_enabled")
+    voice_note_transcribe_timeout_s = _parse_positive_float(
+        values["voice_note_transcribe_timeout_s"],
+        field_name="voice_note_transcribe_timeout_s",
+    )
+    voice_note_max_chars = _parse_positive_int(values["voice_note_max_chars"], field_name="voice_note_max_chars")
+    tts_enabled = _parse_bool(values["tts_enabled"], field_name="tts_enabled")
+    tts_timeout_s = _parse_positive_float(values["tts_timeout_s"], field_name="tts_timeout_s")
+    tts_max_chars = _parse_positive_int(values["tts_max_chars"], field_name="tts_max_chars")
 
     return RuntimeConfig(
         token=str(values["token"]),
@@ -210,6 +272,28 @@ def parse_runtime_config(
         context_compaction_cooldown_s=context_compaction_cooldown_s,
         context_strict_io=context_strict_io,
         context_manual_compact=context_manual_compact,
+        voice_notes_enabled=voice_notes_enabled,
+        voice_note_whisper_command=str(values["voice_note_whisper_command"]).strip() or "whisper",
+        voice_note_whisper_model=str(values["voice_note_whisper_model"]).strip() or "turbo",
+        voice_note_language=(str(values["voice_note_language"]).strip() or None),
+        voice_note_transcribe_timeout_s=voice_note_transcribe_timeout_s,
+        voice_note_max_chars=voice_note_max_chars,
+        voice_note_temp_dir=str(values["voice_note_temp_dir"]).strip() or ".channel_runtime/voice_notes",
+        tts_enabled=tts_enabled,
+        tts_command=str(values["tts_command"]).strip(),
+        tts_timeout_s=tts_timeout_s,
+        tts_max_chars=tts_max_chars,
+        tts_temp_dir=str(values["tts_temp_dir"]).strip() or ".channel_runtime/tts",
+        tts_voice=(str(values["tts_voice"]).strip() or None),
+        tts_language=(str(values["tts_language"]).strip() or None),
+        meal_options_path=str(values["meal_options_path"]).strip() or "data/meal_options.json",
+        acquisition_mode=str(values["acquisition_mode"]),
+        acquisition_allowed_job_types=_parse_allowlist(
+            values["acquisition_allowed_job_types"],
+            field_name="acquisition_allowed_job_types",
+        ),
+        acquisition_artifact_dir=str(values["acquisition_artifact_dir"]).strip() or ".channel_runtime/acquisitions",
+        acquisition_command=str(values["acquisition_command"]).strip(),
     )
 
 
@@ -247,6 +331,25 @@ def _apply_cli_overrides(values: dict[str, object], args: list[str]) -> None:
             "--context-compaction-cooldown-s",
             "--context-strict-io",
             "--context-manual-compact",
+            "--voice-notes-enabled",
+            "--voice-note-whisper-command",
+            "--voice-note-whisper-model",
+            "--voice-note-language",
+            "--voice-note-transcribe-timeout-s",
+            "--voice-note-max-chars",
+            "--voice-note-temp-dir",
+            "--tts-enabled",
+            "--tts-command",
+            "--tts-timeout-s",
+            "--tts-max-chars",
+            "--tts-temp-dir",
+            "--tts-voice",
+            "--tts-language",
+            "--meal-options-path",
+            "--acquisition-mode",
+            "--acquisition-allowed-job-types",
+            "--acquisition-artifact-dir",
+            "--acquisition-command",
         }:
             if i + 1 >= len(args):
                 raise ConfigValidationError(f"missing value for {arg}")
@@ -299,6 +402,44 @@ def _apply_cli_overrides(values: dict[str, object], args: list[str]) -> None:
                 values["context_strict_io"] = value
             elif arg == "--context-manual-compact":
                 values["context_manual_compact"] = value
+            elif arg == "--voice-notes-enabled":
+                values["voice_notes_enabled"] = value
+            elif arg == "--voice-note-whisper-command":
+                values["voice_note_whisper_command"] = value
+            elif arg == "--voice-note-whisper-model":
+                values["voice_note_whisper_model"] = value
+            elif arg == "--voice-note-language":
+                values["voice_note_language"] = value
+            elif arg == "--voice-note-transcribe-timeout-s":
+                values["voice_note_transcribe_timeout_s"] = value
+            elif arg == "--voice-note-max-chars":
+                values["voice_note_max_chars"] = value
+            elif arg == "--voice-note-temp-dir":
+                values["voice_note_temp_dir"] = value
+            elif arg == "--tts-enabled":
+                values["tts_enabled"] = value
+            elif arg == "--tts-command":
+                values["tts_command"] = value
+            elif arg == "--tts-timeout-s":
+                values["tts_timeout_s"] = value
+            elif arg == "--tts-max-chars":
+                values["tts_max_chars"] = value
+            elif arg == "--tts-temp-dir":
+                values["tts_temp_dir"] = value
+            elif arg == "--tts-voice":
+                values["tts_voice"] = value
+            elif arg == "--tts-language":
+                values["tts_language"] = value
+            elif arg == "--meal-options-path":
+                values["meal_options_path"] = value
+            elif arg == "--acquisition-mode":
+                values["acquisition_mode"] = value
+            elif arg == "--acquisition-allowed-job-types":
+                values["acquisition_allowed_job_types"] = value
+            elif arg == "--acquisition-artifact-dir":
+                values["acquisition_artifact_dir"] = value
+            elif arg == "--acquisition-command":
+                values["acquisition_command"] = value
             i += 2
             continue
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import socket
 import sys
 import tempfile
 import unittest
@@ -9,6 +11,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from channel_core.contracts import ContractValidationError, InboundMessage
+from channel_runtime.acquisition import AcquisitionDispatcherError
 from channel_runtime.context.compaction import CompactionPolicy, CompactionService
 from channel_runtime.context.contracts import ContextTurn
 from channel_runtime.context.errors import ContextStoreError
@@ -34,6 +37,181 @@ def _inbound(update_id: str, *, text: str = "hello", chat_id: str = "100") -> In
 
 
 class TestCodexOrchestrator(unittest.TestCase):
+    def test_tts_command_returns_voice_marked_outbound_without_invoking_codex(self) -> None:
+        calls: list[CodexInvocationRequest] = []
+
+        def _invoke(request: CodexInvocationRequest) -> str | None:
+            calls.append(request)
+            return "should-not-run"
+
+        orchestrator = CodexOrchestrator(invoke_fn=_invoke)
+        outbound = orchestrator.handle_message(_inbound("1", text="/speak hello there"), session_id="telegram:tts")
+
+        self.assertIsNotNone(outbound)
+        assert outbound is not None
+        self.assertEqual(calls, [])
+        self.assertEqual(outbound.text, "hello there")
+        self.assertTrue(outbound.metadata["telegram_tts"]["enabled"])
+        self.assertEqual(outbound.metadata["telegram_tts"]["fallback_text"], "hello there")
+
+    def test_tts_command_without_text_returns_usage(self) -> None:
+        orchestrator = CodexOrchestrator(invoke_fn=lambda _: "should-not-run")
+        outbound = orchestrator.handle_message(_inbound("1", text="/tts"), session_id="telegram:tts")
+
+        self.assertIsNotNone(outbound)
+        assert outbound is not None
+        self.assertEqual(outbound.text, "Usage: /speak <text> or /tts <text>")
+
+    def test_dinner_command_returns_plan_without_invoking_codex(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "meal_options.json"
+            path.write_text(
+                '{"meals":["Chili","Curry","Pasta","Pie","Stew","Soup"]}',
+                encoding="utf-8",
+            )
+            calls: list[CodexInvocationRequest] = []
+
+            def _invoke(request: CodexInvocationRequest) -> str | None:
+                calls.append(request)
+                return "should-not-run"
+
+            orchestrator = CodexOrchestrator(invoke_fn=_invoke, meal_options_path=str(path))
+            outbound = orchestrator.handle_message(_inbound("1", text="/dinners 5"), session_id="telegram:dinners")
+
+        self.assertIsNotNone(outbound)
+        assert outbound is not None
+        self.assertEqual(calls, [])
+        self.assertIn("Dinner plan (5 dinners):", outbound.text)
+        self.assertEqual(outbound.metadata["orchestrator_mode"], "codex")
+
+    def test_operator_runtime_env_writes_allowlisted_snapshot_without_invoking_codex(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "runtime-env.log"
+            env = {
+                "HTTP_PROXY": "http://proxy.internal:8080",
+                "HTTPS_PROXY": "http://user:pass@proxy.internal:8443",
+                "CHANNEL_ACQUISITION_MODE": "command",
+                "UNRELATED_SECRET": "should-not-appear",
+            }
+            calls: list[CodexInvocationRequest] = []
+
+            def _invoke(request: CodexInvocationRequest) -> str | None:
+                calls.append(request)
+                return "should-not-run"
+
+            orchestrator = CodexOrchestrator(
+                invoke_fn=_invoke,
+                enable_context_operator_controls=True,
+                env_provider=env,
+                runtime_env_log_path=log_path,
+            )
+            outbound = orchestrator.handle_message(_inbound("1", text="/runtime env"), session_id="telegram:runtime-env")
+
+            self.assertIsNotNone(outbound)
+            assert outbound is not None
+            self.assertEqual(calls, [])
+            self.assertIn("runtime env:", outbound.text)
+            self.assertIn(f"log_path={log_path}", outbound.text)
+            self.assertEqual(outbound.metadata["operator_command"], "runtime-env")
+            self.assertEqual(outbound.metadata["operator_status"], "ok")
+            self.assertTrue(log_path.exists())
+
+            rows = log_path.read_text(encoding="utf-8").strip().splitlines()
+            self.assertEqual(len(rows), 1)
+            payload = json.loads(rows[0])
+            self.assertEqual(payload["session_id"], "telegram:runtime-env")
+            env_rows = {item["key"]: item for item in payload["env"]}
+            self.assertEqual(env_rows["HTTP_PROXY"]["value"], "http://proxy.internal:8080")
+            self.assertEqual(env_rows["HTTPS_PROXY"]["value"], "http://<redacted>@proxy.internal:8443")
+            self.assertNotIn("user:pass", json.dumps(payload, sort_keys=True))
+            self.assertEqual(env_rows["CHANNEL_ACQUISITION_MODE"]["value"], "command")
+            self.assertNotIn("UNRELATED_SECRET", env_rows)
+
+    def test_operator_runtime_youtube_probe_writes_runtime_side_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "youtube-probe.log"
+            calls: list[CodexInvocationRequest] = []
+
+            def _invoke(request: CodexInvocationRequest) -> str | None:
+                calls.append(request)
+                return "should-not-run"
+
+            orchestrator = CodexOrchestrator(
+                invoke_fn=_invoke,
+                enable_context_operator_controls=True,
+                runtime_youtube_probe_log_path=log_path,
+            )
+            with mock.patch(
+                "channel_runtime.codex_orchestrator.acquisition_helper.build_response",
+                return_value={
+                    "job_type": "youtube-transcript",
+                    "artifact": {
+                        "video_id": "dQw4w9WgXcQ",
+                        "transcript_text": "abc",
+                        "segment_count": 1,
+                        "truncated": False,
+                        "language_code": "en",
+                    },
+                },
+            ), mock.patch(
+                "channel_runtime.codex_orchestrator.socket.getaddrinfo",
+                return_value=[(None, None, None, None, ("142.251.142.206", 443))],
+            ):
+                outbound = orchestrator.handle_message(
+                    _inbound("1", text="/runtime youtube-probe https://youtu.be/dQw4w9WgXcQ"),
+                    session_id="telegram:youtube-probe",
+                )
+
+            self.assertIsNotNone(outbound)
+            assert outbound is not None
+            self.assertEqual(calls, [])
+            self.assertIn("runtime youtube-probe:", outbound.text)
+            self.assertIn("probe_code=transcript-fetched", outbound.text)
+            self.assertEqual(outbound.metadata["operator_command"], "runtime-youtube-probe")
+            self.assertTrue(log_path.exists())
+
+            payload = json.loads(log_path.read_text(encoding="utf-8").strip().splitlines()[-1])
+            self.assertEqual(payload["status"], "ok")
+            self.assertEqual(payload["video_id"], "dQw4w9WgXcQ")
+            self.assertEqual(payload["artifact"]["transcript_chars"], 3)
+            self.assertEqual(payload["dns"][0]["status"], "ok")
+
+    def test_operator_runtime_youtube_probe_logs_transcript_error_code(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "youtube-probe.log"
+            orchestrator = CodexOrchestrator(
+                invoke_fn=lambda _: "should-not-run",
+                enable_context_operator_controls=True,
+                runtime_youtube_probe_log_path=log_path,
+            )
+            from channel_runtime.youtube_transcript import YouTubeTranscriptError
+
+            failure = YouTubeTranscriptError(
+                code="youtube-transcript-network-dns",
+                user_message="dns blocked",
+                detail="failed to fetch transcript for video_id=dQw4w9WgXcQ: ConnectionError: name or service not known",
+            )
+            with mock.patch(
+                "channel_runtime.codex_orchestrator.acquisition_helper.build_response",
+                side_effect=failure,
+            ), mock.patch(
+                "channel_runtime.codex_orchestrator.socket.getaddrinfo",
+                side_effect=socket.gaierror(-2, "Name or service not known"),
+            ):
+                outbound = orchestrator.handle_message(
+                    _inbound("1", text="/runtime youtube probe https://youtu.be/dQw4w9WgXcQ"),
+                    session_id="telegram:youtube-probe-fail",
+                )
+
+            self.assertIsNotNone(outbound)
+            assert outbound is not None
+            self.assertIn("probe_code=youtube-transcript-network-dns", outbound.text)
+            payload = json.loads(log_path.read_text(encoding="utf-8").strip().splitlines()[-1])
+            self.assertEqual(payload["status"], "failed")
+            self.assertEqual(payload["probe_code"], "youtube-transcript-network-dns")
+            self.assertEqual(payload["error"]["code"], "youtube-transcript-network-dns")
+            self.assertEqual(payload["dns"][0]["status"], "failed")
+
     def test_operator_inspect_reports_session_state_without_invoking_codex(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ContextStore(root_dir=Path(tmpdir) / ".channel_runtime" / "context", strict_io=False)
@@ -309,6 +487,127 @@ class TestCodexOrchestrator(unittest.TestCase):
             self.assertEqual(telemetry["counters"]["compaction_succeeded_total"], 0)
             self.assertEqual(telemetry["counters"]["compaction_failed_total"], 1)
             self.assertEqual(telemetry["counters"]["compaction_fallback_used_total"], 1)
+
+    def test_youtube_link_message_enriches_codex_request_with_transcript(self) -> None:
+        requests: list[CodexInvocationRequest] = []
+
+        def _invoke(request: CodexInvocationRequest) -> str | None:
+            requests.append(request)
+            return "video ideas"
+
+        class _Transcript:
+            source_url = "https://youtu.be/dQw4w9WgXcQ"
+            video_id = "dQw4w9WgXcQ"
+            transcript_text = "segment one segment two"
+            segment_count = 2
+            truncated = False
+            language_code = "en"
+
+        orchestrator = CodexOrchestrator(
+            invoke_fn=_invoke,
+            youtube_transcript_fetcher=lambda _: _Transcript(),
+        )
+
+        outbound = orchestrator.handle_message(
+            _inbound("1", text="Please review this video https://youtu.be/dQw4w9WgXcQ"),
+            session_id="telegram:youtube",
+        )
+
+        self.assertIsNotNone(outbound)
+        assert outbound is not None
+        self.assertEqual(outbound.text, "video ideas")
+        self.assertEqual(len(requests), 1)
+        self.assertIn("The user sent a YouTube video link through Telegram.", requests[0].text)
+        self.assertIn("Transcript:\nsegment one segment two", requests[0].text)
+
+    def test_youtube_link_message_returns_direct_failure_when_transcript_unavailable(self) -> None:
+        requests: list[CodexInvocationRequest] = []
+
+        def _invoke(request: CodexInvocationRequest) -> str | None:
+            requests.append(request)
+            return "should-not-run"
+
+        def _failing_fetcher(_: str) -> object:
+            raise RuntimeError("captions disabled")
+
+        orchestrator = CodexOrchestrator(
+            invoke_fn=_invoke,
+            youtube_transcript_fetcher=_failing_fetcher,
+        )
+
+        outbound = orchestrator.handle_message(
+            _inbound("1", text="https://youtu.be/dQw4w9WgXcQ"),
+            session_id="telegram:youtube-fail",
+        )
+
+        self.assertIsNotNone(outbound)
+        assert outbound is not None
+        self.assertEqual(requests, [])
+        self.assertIn("couldn't fetch a transcript", outbound.text)
+        self.assertEqual(outbound.metadata["fallback"], "youtube-transcript-error")
+
+    def test_message_preparer_runs_before_codex_invoke(self) -> None:
+        requests: list[CodexInvocationRequest] = []
+
+        def _invoke(request: CodexInvocationRequest) -> str | None:
+            requests.append(request)
+            return "prepared"
+
+        orchestrator = CodexOrchestrator(
+            invoke_fn=_invoke,
+            message_preparer=lambda text: f"prepared::{text}",
+        )
+
+        outbound = orchestrator.handle_message(
+            _inbound("1", text="hello"),
+            session_id="telegram:prepared",
+        )
+
+        self.assertIsNotNone(outbound)
+        assert outbound is not None
+        self.assertEqual(outbound.text, "prepared")
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].text, "prepared::hello")
+
+    def test_message_preparer_failure_surfaces_acquisition_metadata(self) -> None:
+        def _raise_acquisition_error(_: str) -> str:
+            raise AcquisitionDispatcherError(
+                code="acquisition-command-failed",
+                user_message="acquisition failed with helper detail",
+                detail="command-mode acquisition failed for youtube-transcript: helper stderr",
+                metadata={
+                    "command": "python3 scripts/run_channel_runtime_acquisition_helper.py",
+                    "returncode": 1,
+                    "helper_error": {
+                        "code": "youtube-transcript-network-dns",
+                        "detail": "name or service not known",
+                    },
+                },
+            )
+
+        orchestrator = CodexOrchestrator(
+            invoke_fn=lambda _: "should-not-run",
+            message_preparer=_raise_acquisition_error,
+        )
+
+        outbound = orchestrator.handle_message(
+            _inbound("1", text="https://youtu.be/dQw4w9WgXcQ"),
+            session_id="telegram:prepared-fail",
+        )
+
+        self.assertIsNotNone(outbound)
+        assert outbound is not None
+        self.assertEqual(outbound.text, "acquisition failed with helper detail")
+        self.assertEqual(outbound.metadata["fallback"], "acquisition-dispatcher-error")
+        self.assertEqual(outbound.metadata["error_code"], "acquisition-command-failed")
+        self.assertEqual(
+            outbound.metadata["error_metadata"]["helper_error"]["code"],
+            "youtube-transcript-network-dns",
+        )
+        diagnostics = orchestrator.drain_diagnostics()
+        self.assertEqual(len(diagnostics), 1)
+        self.assertEqual(diagnostics[0]["layer"], "acquisition")
+        self.assertEqual(diagnostics[0]["acquisition"]["returncode"], 1)
 
     def test_legacy_mode_overflow_does_not_use_compaction_recovery(self) -> None:
         class _NoCompactionExpected:
@@ -791,7 +1090,9 @@ class TestDefaultCodexInvoke(unittest.TestCase):
             conversation_history=(),
         )
 
-        with mock.patch("channel_runtime.codex_orchestrator.subprocess.run") as run_mock:
+        with mock.patch.dict("channel_runtime.codex_orchestrator.os.environ", {}, clear=True), mock.patch(
+            "channel_runtime.codex_orchestrator.subprocess.run"
+        ) as run_mock:
             run_mock.return_value = mock.Mock(returncode=0, stdout="ok\n", stderr="")
             output = _default_codex_invoke(request, timeout_s=3.0)
 
@@ -803,6 +1104,128 @@ class TestDefaultCodexInvoke(unittest.TestCase):
         self.assertEqual(args[4], "--skip-git-repo-check")
         self.assertEqual(args[5], "--cd")
         self.assertEqual(args[6], "/home/cwilson/projects")
+        self.assertNotIn("--search", args)
+        self.assertNotIn("--profile", args)
+        self.assertNotIn("-c", args)
+        self.assertEqual(json.loads(args[7])["text"], "hello")
+        self.assertEqual(run_mock.call_args.kwargs["timeout"], 3.0)
+
+    def test_invokes_codex_with_config_default_sandbox_and_search_opt_in(self) -> None:
+        request = CodexInvocationRequest(
+            session_id="telegram:100",
+            chat_id="100",
+            user_id="u-1",
+            text="hello",
+            update_id="1",
+            message_id="m-1",
+            conversation_history=(),
+        )
+        env = {
+            "CHANNEL_CODEX_SANDBOX_MODE": "config-default",
+            "CHANNEL_CODEX_DEFAULT_PERMISSIONS": "workspace-network",
+            "CHANNEL_CODEX_SEARCH": "true",
+        }
+
+        with mock.patch.dict("channel_runtime.codex_orchestrator.os.environ", env, clear=True), mock.patch(
+            "channel_runtime.codex_orchestrator.subprocess.run"
+        ) as run_mock:
+            run_mock.return_value = mock.Mock(returncode=0, stdout="ok\n", stderr="")
+            output = _default_codex_invoke(request, timeout_s=3.0)
+
+        self.assertEqual(output, "ok")
+        args = run_mock.call_args.args[0]
+        self.assertEqual(args[0:3], ["codex", "--search", "exec"])
+        self.assertNotIn("--sandbox", args)
+        self.assertIn("-c", args)
+        self.assertIn('default_permissions="workspace-network"', args)
+        self.assertEqual(args[-2:], ["/home/cwilson/projects", mock.ANY])
+        self.assertEqual(run_mock.call_args.kwargs["timeout"], 3.0)
+
+    def test_search_false_does_not_add_search_flag(self) -> None:
+        request = CodexInvocationRequest(
+            session_id="telegram:100",
+            chat_id="100",
+            user_id="u-1",
+            text="hello",
+            update_id="1",
+            message_id="m-1",
+            conversation_history=(),
+        )
+
+        with mock.patch.dict(
+            "channel_runtime.codex_orchestrator.os.environ",
+            {"CHANNEL_CODEX_SEARCH": "false"},
+            clear=True,
+        ), mock.patch("channel_runtime.codex_orchestrator.subprocess.run") as run_mock:
+            run_mock.return_value = mock.Mock(returncode=0, stdout="ok\n", stderr="")
+            _default_codex_invoke(request, timeout_s=3.0)
+
+        args = run_mock.call_args.args[0]
+        self.assertEqual(args[0:2], ["codex", "exec"])
+        self.assertNotIn("--search", args)
+        self.assertIn("--sandbox", args)
+        self.assertIn("workspace-write", args)
+
+    def test_invokes_codex_with_profile_when_configured(self) -> None:
+        request = CodexInvocationRequest(
+            session_id="telegram:100",
+            chat_id="100",
+            user_id="u-1",
+            text="hello",
+            update_id="1",
+            message_id="m-1",
+            conversation_history=(),
+        )
+
+        with mock.patch.dict(
+            "channel_runtime.codex_orchestrator.os.environ",
+            {"CHANNEL_CODEX_PROFILE": "telegram-network"},
+            clear=True,
+        ), mock.patch("channel_runtime.codex_orchestrator.subprocess.run") as run_mock:
+            run_mock.return_value = mock.Mock(returncode=0, stdout="ok\n", stderr="")
+            _default_codex_invoke(request, timeout_s=3.0)
+
+        args = run_mock.call_args.args[0]
+        self.assertIn("--profile", args)
+        self.assertIn("telegram-network", args)
+        self.assertIn("--sandbox", args)
+        self.assertIn("workspace-write", args)
+
+    def test_rejects_danger_full_access_sandbox_override(self) -> None:
+        request = CodexInvocationRequest(
+            session_id="telegram:100",
+            chat_id="100",
+            user_id="u-1",
+            text="hello",
+            update_id="1",
+            message_id="m-1",
+            conversation_history=(),
+        )
+
+        with mock.patch.dict(
+            "channel_runtime.codex_orchestrator.os.environ",
+            {"CHANNEL_CODEX_SANDBOX_MODE": "danger-full-access"},
+            clear=True,
+        ), self.assertRaisesRegex(CodexExecError, "Invalid CHANNEL_CODEX_SANDBOX_MODE"):
+            _default_codex_invoke(request, timeout_s=3.0)
+
+    def test_rejects_invalid_search_override(self) -> None:
+        request = CodexInvocationRequest(
+            session_id="telegram:100",
+            chat_id="100",
+            user_id="u-1",
+            text="hello",
+            update_id="1",
+            message_id="m-1",
+            conversation_history=(),
+        )
+
+        with mock.patch.dict(
+            "channel_runtime.codex_orchestrator.os.environ",
+            {"CHANNEL_CODEX_SEARCH": "sometimes"},
+            clear=True,
+        ), self.assertRaisesRegex(CodexExecError, "Invalid CHANNEL_CODEX_SEARCH"):
+            _default_codex_invoke(request, timeout_s=3.0)
 
     def test_invokes_subprocess_with_provided_timeout(self) -> None:
         request = CodexInvocationRequest(
@@ -815,7 +1238,9 @@ class TestDefaultCodexInvoke(unittest.TestCase):
             conversation_history=(),
         )
 
-        with mock.patch("channel_runtime.codex_orchestrator.subprocess.run") as run_mock:
+        with mock.patch.dict("channel_runtime.codex_orchestrator.os.environ", {}, clear=True), mock.patch(
+            "channel_runtime.codex_orchestrator.subprocess.run"
+        ) as run_mock:
             run_mock.return_value = mock.Mock(returncode=0, stdout="ok", stderr="")
             _default_codex_invoke(request, timeout_s=12.5)
 

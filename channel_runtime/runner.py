@@ -14,11 +14,15 @@ from channel_core.service import process_once
 from telegram_channel.adapter import TelegramChannelAdapter
 from telegram_channel.api import TelegramApiClient
 from telegram_channel.cursor_state import DurableCursorStateStore
+from telegram_channel.tts import TelegramTextToSpeechProcessor, TextToSpeechConfig
+from telegram_channel.voice_notes import TelegramVoiceNoteProcessor, VoiceNoteConfig
 
 from .codex_orchestrator import CodexInvocationRequest, CodexOrchestrator, CodexSessionManager, CodexSessionPolicy
 from .config import RuntimeConfig
 from .context.compaction import CompactionPolicy, CompactionService
 from .context.store import ContextStore
+from .dinner_selector import build_dinner_command_response
+from .acquisition import PrivilegedAcquisitionDispatcher
 
 
 PublishSystemEventFn = Callable[..., dict[str, Any]]
@@ -34,6 +38,8 @@ _TELEMETRY_PLACEHOLDERS = {
     "queue_depth": "pending-runtime-queue-introspection",
     "worker_restart_total": "pending-supervisor-integration",
 }
+_TTS_COMMAND_PREFIXES = ("/speak ", "/tts ")
+_TTS_COMMANDS = frozenset({"/speak", "/tts"})
 
 
 @dataclass(frozen=True)
@@ -75,13 +81,26 @@ class DefaultOrchestrator:
         *,
         enable_memory_hook: bool = False,
         memory_lookup: MemoryLookupFn | None = None,
+        meal_options_path: str = "data/meal_options.json",
     ) -> None:
         self._enable_memory_hook = bool(enable_memory_hook)
         self._memory_lookup = memory_lookup
+        self._meal_options_path = str(meal_options_path).strip() or "data/meal_options.json"
         self._diagnostics: list[dict[str, Any]] = []
 
     def handle_message(self, inbound: InboundMessage, *, session_id: str) -> OutboundMessage | None:
         try:
+            tts_request = _build_tts_command_response(inbound=inbound, session_id=session_id, orchestrator_mode="default")
+            if tts_request is not None:
+                return tts_request
+            dinner_request = build_dinner_command_response(
+                inbound=inbound,
+                session_id=session_id,
+                meal_options_path=self._meal_options_path,
+                orchestrator_mode="default",
+            )
+            if dinner_request is not None:
+                return dinner_request
             text = f"echo: {inbound.text}"
             if self._enable_memory_hook:
                 lookup = self._memory_lookup or _default_memory_lookup
@@ -203,6 +222,53 @@ class DurableContextCanaryOrchestrator:
         )
 
 
+class TelegramVoiceReplyOrchestrator:
+    """Marks replies to inbound Telegram voice notes for optional TTS delivery."""
+
+    def __init__(self, delegate: OrchestratorPort, *, enabled: bool) -> None:
+        self._delegate = delegate
+        self._enabled = bool(enabled)
+
+    def handle_message(self, inbound: InboundMessage, *, session_id: str) -> OutboundMessage | None:
+        outbound = self._delegate.handle_message(inbound, session_id=session_id)
+        if not self._enabled or outbound is None or not isinstance(outbound, OutboundMessage):
+            return outbound
+        if not _inbound_is_voice_note(inbound):
+            return outbound
+        metadata = dict(outbound.metadata)
+        existing = metadata.get("telegram_tts")
+        if isinstance(existing, Mapping) and existing.get("enabled"):
+            return outbound
+        metadata["telegram_tts"] = {
+            "enabled": True,
+            "fallback_text": outbound.text,
+        }
+        return OutboundMessage(
+            chat_id=outbound.chat_id,
+            text=outbound.text,
+            reply_to_message_id=outbound.reply_to_message_id,
+            metadata=metadata,
+        )
+
+    def drain_diagnostics(self) -> list[dict[str, Any]]:
+        delegate_drain = getattr(self._delegate, "drain_diagnostics", None)
+        if not callable(delegate_drain):
+            return []
+        drained = delegate_drain()
+        if not isinstance(drained, list):
+            return []
+        return [dict(item) for item in drained if isinstance(item, Mapping)]
+
+    def drain_context_telemetry(self) -> dict[str, Any]:
+        delegate_drain = getattr(self._delegate, "drain_context_telemetry", None)
+        if not callable(delegate_drain):
+            return {}
+        drained = delegate_drain()
+        if not isinstance(drained, Mapping):
+            return {}
+        return dict(drained)
+
+
 def run_cycle(
     *,
     config: RuntimeConfig,
@@ -217,16 +283,23 @@ def run_cycle(
 ) -> dict[str, Any]:
     """Run one TG-P2 service cycle with default runtime wiring."""
     cycle_started_at = time.perf_counter()
+    resolved_api_client = api_client or TelegramApiClient(config.token)
     resolved_adapter = adapter or TelegramChannelAdapter(
-        api_client or TelegramApiClient(config.token),
+        resolved_api_client,
         cursor_state_store=_resolve_cursor_state_store(config.cursor_state_path),
         strict_state_io=config.strict_cursor_state_io,
+        voice_note_processor=_resolve_voice_note_processor(resolved_api_client, config=config),
+        text_to_speech_processor=_resolve_text_to_speech_processor(config=config),
     )
     resolved_orchestrator = orchestrator or _resolve_default_orchestrator(
         config=config,
         enable_memory_hook=enable_memory_hook,
         memory_lookup=memory_lookup,
         codex_invoke=codex_invoke,
+    )
+    resolved_orchestrator = TelegramVoiceReplyOrchestrator(
+        resolved_orchestrator,
+        enabled=config.tts_enabled,
     )
     emitter = heartbeat_emitter or HeartbeatEventEmitter()
     heartbeat_emit_attempts = 0
@@ -718,6 +791,7 @@ def _resolve_default_orchestrator(
     return DefaultOrchestrator(
         enable_memory_hook=_resolve_memory_hook_flag(enable_memory_hook),
         memory_lookup=memory_lookup,
+        meal_options_path=config.meal_options_path,
     )
 
 
@@ -762,6 +836,39 @@ def _resolve_cursor_state_store(path: str) -> DurableCursorStateStore | None:
     return DurableCursorStateStore(Path(normalized))
 
 
+def _resolve_voice_note_processor(
+    api_client: TelegramApiClient,
+    *,
+    config: RuntimeConfig,
+) -> TelegramVoiceNoteProcessor | None:
+    return TelegramVoiceNoteProcessor(
+        api_client,
+        config=VoiceNoteConfig(
+            enabled=config.voice_notes_enabled,
+            whisper_command=config.voice_note_whisper_command,
+            whisper_model=config.voice_note_whisper_model,
+            language=config.voice_note_language,
+            transcribe_timeout_s=config.voice_note_transcribe_timeout_s,
+            max_chars=config.voice_note_max_chars,
+            temp_dir=config.voice_note_temp_dir,
+        ),
+    )
+
+
+def _resolve_text_to_speech_processor(*, config: RuntimeConfig) -> TelegramTextToSpeechProcessor | None:
+    return TelegramTextToSpeechProcessor(
+        config=TextToSpeechConfig(
+            enabled=config.tts_enabled,
+            command=config.tts_command,
+            timeout_s=config.tts_timeout_s,
+            max_chars=config.tts_max_chars,
+            temp_dir=config.tts_temp_dir,
+            voice=config.tts_voice,
+            language=config.tts_language,
+        ),
+    )
+
+
 def _drain_diagnostics(source: str, target: Any) -> list[DiagnosticEntry]:
     drain_fn = getattr(target, "drain_diagnostics", None)
     if not callable(drain_fn):
@@ -786,6 +893,55 @@ def _normalize_chat_id_value(value: object) -> str | None:
         return str(int(text))
     except ValueError:
         return text
+
+
+def _inbound_is_voice_note(inbound: InboundMessage) -> bool:
+    metadata = inbound.metadata if isinstance(inbound.metadata, Mapping) else {}
+    return str(metadata.get("content_type", "")).strip().lower() == "voice"
+
+
+def _build_tts_command_response(
+    *,
+    inbound: InboundMessage,
+    session_id: str,
+    orchestrator_mode: str,
+) -> OutboundMessage | None:
+    command_text = str(inbound.text).strip()
+    if not command_text:
+        return None
+    normalized = command_text.lower()
+    if normalized in _TTS_COMMANDS:
+        return OutboundMessage(
+            chat_id=inbound.chat_id,
+            text="Usage: /speak <text> or /tts <text>",
+            reply_to_message_id=inbound.message_id,
+            metadata={"session_id": session_id, "orchestrator_mode": orchestrator_mode},
+        )
+    for prefix in _TTS_COMMAND_PREFIXES:
+        if normalized.startswith(prefix):
+            spoken_text = command_text[len(prefix) :].strip()
+            if not spoken_text:
+                return OutboundMessage(
+                    chat_id=inbound.chat_id,
+                    text="Usage: /speak <text> or /tts <text>",
+                    reply_to_message_id=inbound.message_id,
+                    metadata={"session_id": session_id, "orchestrator_mode": orchestrator_mode},
+                )
+            return OutboundMessage(
+                chat_id=inbound.chat_id,
+                text=spoken_text,
+                reply_to_message_id=inbound.message_id,
+                metadata={
+                    "session_id": session_id,
+                    "orchestrator_mode": orchestrator_mode,
+                    "telegram_tts": {
+                        "enabled": True,
+                        "text": spoken_text,
+                        "fallback_text": spoken_text,
+                    },
+                },
+            )
+    return None
 
 
 def _build_codex_orchestrator(
@@ -816,13 +972,27 @@ def _build_codex_orchestrator(
         timeout_s=config.codex_timeout_s,
         notify_on_error=config.notify_on_orchestrator_error,
         invoke_fn=codex_invoke,
+        message_preparer=_resolve_message_preparer(config),
         session_manager=CodexSessionManager(policy=session_policy),
         context_mode=resolved_mode,
         context_store=context_store,
         compaction_service=compaction_service,
         compaction_policy=compaction_policy,
         enable_context_operator_controls=config.context_manual_compact,
+        meal_options_path=config.meal_options_path,
     )
+
+
+def _resolve_message_preparer(config: RuntimeConfig) -> Callable[[str], str] | None:
+    if config.acquisition_mode == "disabled":
+        return None
+    dispatcher = PrivilegedAcquisitionDispatcher(
+        mode=config.acquisition_mode,
+        allowed_job_types=config.acquisition_allowed_job_types,
+        artifact_root=config.acquisition_artifact_dir,
+        command=config.acquisition_command,
+    )
+    return dispatcher.prepare_message_text
 
 
 def _drain_delegate_context_telemetry(target: Any) -> dict[str, Any]:

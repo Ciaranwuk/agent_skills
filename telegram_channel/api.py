@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping
 from urllib import error, request
@@ -123,6 +124,93 @@ class TelegramApiClient:
             )
         return result
 
+    def send_voice(
+        self,
+        *,
+        chat_id: str | int,
+        voice_bytes: bytes,
+        filename: str = "speech.ogg",
+        reply_to_message_id: str | int | None = None,
+        caption: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"chat_id": chat_id}
+        if reply_to_message_id is not None:
+            payload["reply_to_message_id"] = reply_to_message_id
+        if caption is not None:
+            payload["caption"] = caption
+        result = self._request_multipart(
+            "sendVoice",
+            payload,
+            file_field="voice",
+            filename=filename,
+            content_type="audio/ogg",
+            file_bytes=voice_bytes,
+        )
+        if not isinstance(result, dict):
+            raise TelegramApiError(
+                operation="sendVoice",
+                kind="invalid-result-shape",
+                transient=False,
+                description="result must be an object",
+            )
+        return result
+
+    def get_file(self, *, file_id: str) -> dict[str, Any]:
+        payload = {"file_id": str(file_id).strip()}
+        result = self._request("getFile", payload)
+        if not isinstance(result, dict):
+            raise TelegramApiError(
+                operation="getFile",
+                kind="invalid-result-shape",
+                transient=False,
+                description="result must be an object",
+            )
+        return result
+
+    def download_file(self, *, file_path: str) -> bytes:
+        normalized = str(file_path).strip().lstrip("/")
+        if not normalized:
+            raise TelegramApiError(
+                operation="downloadFile",
+                kind="invalid-file-path",
+                transient=False,
+                description="file_path must be a non-empty string",
+            )
+
+        req = request.Request(
+            url=f"https://api.telegram.org/file/bot{self._token}/{normalized}",
+            method="GET",
+        )
+        try:
+            with self._opener(req, timeout=self._timeout_s) as response:
+                return response.read()
+        except error.HTTPError as exc:
+            raise _map_http_error(operation="downloadFile", exc=exc) from exc
+        except error.URLError as exc:
+            raise TelegramApiError(
+                operation="downloadFile",
+                kind="network-error",
+                transient=True,
+                description=str(exc.reason),
+                retry_class="transient",
+            ) from exc
+        except TimeoutError as exc:
+            raise TelegramApiError(
+                operation="downloadFile",
+                kind="timeout",
+                transient=True,
+                description=str(exc),
+                retry_class="transient",
+            ) from exc
+        except OSError as exc:
+            raise TelegramApiError(
+                operation="downloadFile",
+                kind="network-error",
+                transient=True,
+                description=str(exc),
+                retry_class="transient",
+            ) from exc
+
     def _request(self, operation: str, payload: Mapping[str, Any]) -> Any:
         attempts = self._max_retries + 1
         last_error: TelegramApiError | None = None
@@ -130,6 +218,47 @@ class TelegramApiClient:
         for attempt in range(attempts):
             try:
                 raw_body = self._post_json(operation, payload)
+                parsed = self._decode_json(operation, raw_body)
+                return self._extract_result(operation, parsed)
+            except TelegramApiError as exc:
+                last_error = exc
+                should_retry = self._should_retry(exc, attempt=attempt)
+                if not should_retry:
+                    raise
+                self._sleeper(self._retry_delay_for(exc, attempt=attempt))
+
+        if last_error is None:
+            raise TelegramApiError(
+                operation=operation,
+                kind="unknown",
+                transient=False,
+                description="request failed with no captured error",
+            )
+        raise last_error
+
+    def _request_multipart(
+        self,
+        operation: str,
+        payload: Mapping[str, Any],
+        *,
+        file_field: str,
+        filename: str,
+        content_type: str,
+        file_bytes: bytes,
+    ) -> Any:
+        attempts = self._max_retries + 1
+        last_error: TelegramApiError | None = None
+
+        for attempt in range(attempts):
+            try:
+                raw_body = self._post_multipart(
+                    operation,
+                    payload,
+                    file_field=file_field,
+                    filename=filename,
+                    content_type=content_type,
+                    file_bytes=file_bytes,
+                )
                 parsed = self._decode_json(operation, raw_body)
                 return self._extract_result(operation, parsed)
             except TelegramApiError as exc:
@@ -161,28 +290,62 @@ class TelegramApiClient:
             with self._opener(req, timeout=self._timeout_s) as response:
                 return response.read()
         except error.HTTPError as exc:
-            raw_body = b""
-            try:
-                raw_body = exc.read()
-            except Exception:
-                raw_body = b""
-            parsed = _try_parse_json(raw_body)
-            description = _extract_description(parsed) or str(exc.reason or "HTTP error")
-            api_error_code = _extract_error_code(parsed)
-            retry_class = _classify_retry_class(status_code=exc.code, error_code=api_error_code)
-            retry_after_seconds = _extract_retry_after(parsed)
-            if retry_after_seconds is None:
-                retry_after_seconds = _extract_retry_after_from_headers(getattr(exc, "headers", None))
+            raise _map_http_error(operation=operation, exc=exc) from exc
+        except error.URLError as exc:
             raise TelegramApiError(
                 operation=operation,
-                kind="http-error",
-                transient=retry_class in _RETRYABLE_CLASSES,
-                description=description,
-                status_code=int(exc.code),
-                error_code=api_error_code,
-                retry_class=retry_class,
-                retry_after_seconds=retry_after_seconds,
+                kind="network-error",
+                transient=True,
+                description=str(exc.reason),
+                retry_class="transient",
             ) from exc
+        except TimeoutError as exc:
+            raise TelegramApiError(
+                operation=operation,
+                kind="timeout",
+                transient=True,
+                description=str(exc),
+                retry_class="transient",
+            ) from exc
+        except OSError as exc:
+            raise TelegramApiError(
+                operation=operation,
+                kind="network-error",
+                transient=True,
+                description=str(exc),
+                retry_class="transient",
+            ) from exc
+
+    def _post_multipart(
+        self,
+        operation: str,
+        payload: Mapping[str, Any],
+        *,
+        file_field: str,
+        filename: str,
+        content_type: str,
+        file_bytes: bytes,
+    ) -> bytes:
+        boundary = f"----telegram-bot-boundary-{uuid.uuid4().hex}"
+        body = _build_multipart_body(
+            payload=payload,
+            file_field=file_field,
+            filename=filename,
+            content_type=content_type,
+            file_bytes=file_bytes,
+            boundary=boundary,
+        )
+        req = request.Request(
+            url=f"https://api.telegram.org/bot{self._token}/{operation}",
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        try:
+            with self._opener(req, timeout=self._timeout_s) as response:
+                return response.read()
+        except error.HTTPError as exc:
+            raise _map_http_error(operation=operation, exc=exc) from exc
         except error.URLError as exc:
             raise TelegramApiError(
                 operation=operation,
@@ -328,3 +491,62 @@ def _coerce_non_negative_float(value: Any) -> float | None:
     if numeric < 0:
         return None
     return numeric
+
+
+def _map_http_error(*, operation: str, exc: error.HTTPError) -> TelegramApiError:
+    raw_body = b""
+    try:
+        raw_body = exc.read()
+    except Exception:
+        raw_body = b""
+    parsed = _try_parse_json(raw_body)
+    description = _extract_description(parsed) or str(exc.reason or "HTTP error")
+    api_error_code = _extract_error_code(parsed)
+    retry_class = _classify_retry_class(status_code=exc.code, error_code=api_error_code)
+    retry_after_seconds = _extract_retry_after(parsed)
+    if retry_after_seconds is None:
+        retry_after_seconds = _extract_retry_after_from_headers(getattr(exc, "headers", None))
+    return TelegramApiError(
+        operation=operation,
+        kind="http-error",
+        transient=retry_class in _RETRYABLE_CLASSES,
+        description=description,
+        status_code=int(exc.code),
+        error_code=api_error_code,
+        retry_class=retry_class,
+        retry_after_seconds=retry_after_seconds,
+    )
+
+
+def _build_multipart_body(
+    *,
+    payload: Mapping[str, Any],
+    file_field: str,
+    filename: str,
+    content_type: str,
+    file_bytes: bytes,
+    boundary: str,
+) -> bytes:
+    chunks: list[bytes] = []
+    for key, value in payload.items():
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode("utf-8"),
+                f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode("utf-8"),
+                str(value).encode("utf-8"),
+                b"\r\n",
+            ]
+        )
+    chunks.extend(
+        [
+            f"--{boundary}\r\n".encode("utf-8"),
+            (
+                f'Content-Disposition: form-data; name="{file_field}"; filename="{filename}"\r\n'
+            ).encode("utf-8"),
+            f"Content-Type: {content_type}\r\n\r\n".encode("utf-8"),
+            bytes(file_bytes),
+            b"\r\n",
+            f"--{boundary}--\r\n".encode("utf-8"),
+        ]
+    )
+    return b"".join(chunks)

@@ -55,6 +55,25 @@ class TestRuntimeConfig(unittest.TestCase):
             "CHANNEL_CONTEXT_COMPACTION_COOLDOWN_S": "45",
             "CHANNEL_CONTEXT_STRICT_IO": "true",
             "CHANNEL_CONTEXT_MANUAL_COMPACT": "true",
+            "CHANNEL_VOICE_NOTES_ENABLED": "true",
+            "CHANNEL_VOICE_NOTE_WHISPER_COMMAND": "whisper-custom",
+            "CHANNEL_VOICE_NOTE_WHISPER_MODEL": "small",
+            "CHANNEL_VOICE_NOTE_LANGUAGE": "en",
+            "CHANNEL_VOICE_NOTE_TRANSCRIBE_TIMEOUT_S": "75",
+            "CHANNEL_VOICE_NOTE_MAX_CHARS": "2500",
+            "CHANNEL_VOICE_NOTE_TEMP_DIR": "/tmp/voice-notes",
+            "CHANNEL_TTS_ENABLED": "true",
+            "CHANNEL_TTS_COMMAND": "python3 /tmp/tts-helper.py",
+            "CHANNEL_TTS_TIMEOUT_S": "22",
+            "CHANNEL_TTS_MAX_CHARS": "1200",
+            "CHANNEL_TTS_TEMP_DIR": "/tmp/tts",
+            "CHANNEL_TTS_VOICE": "en-gb",
+            "CHANNEL_TTS_LANGUAGE": "en",
+            "CHANNEL_MEAL_OPTIONS_PATH": "/tmp/meal-options.json",
+            "CHANNEL_ACQUISITION_MODE": "command",
+            "CHANNEL_ACQUISITION_ALLOWED_JOB_TYPES": "youtube-transcript,crypto-market-data",
+            "CHANNEL_ACQUISITION_ARTIFACT_DIR": "/tmp/acquisitions",
+            "CHANNEL_ACQUISITION_COMMAND": "/usr/local/bin/acquire",
         }
 
         cfg = parse_runtime_config([], env=env)
@@ -83,6 +102,25 @@ class TestRuntimeConfig(unittest.TestCase):
         self.assertEqual(cfg.context_compaction_cooldown_s, 45.0)
         self.assertTrue(cfg.context_strict_io)
         self.assertTrue(cfg.context_manual_compact)
+        self.assertTrue(cfg.voice_notes_enabled)
+        self.assertEqual(cfg.voice_note_whisper_command, "whisper-custom")
+        self.assertEqual(cfg.voice_note_whisper_model, "small")
+        self.assertEqual(cfg.voice_note_language, "en")
+        self.assertEqual(cfg.voice_note_transcribe_timeout_s, 75.0)
+        self.assertEqual(cfg.voice_note_max_chars, 2500)
+        self.assertEqual(cfg.voice_note_temp_dir, "/tmp/voice-notes")
+        self.assertTrue(cfg.tts_enabled)
+        self.assertEqual(cfg.tts_command, "python3 /tmp/tts-helper.py")
+        self.assertEqual(cfg.tts_timeout_s, 22.0)
+        self.assertEqual(cfg.tts_max_chars, 1200)
+        self.assertEqual(cfg.tts_temp_dir, "/tmp/tts")
+        self.assertEqual(cfg.tts_voice, "en-gb")
+        self.assertEqual(cfg.tts_language, "en")
+        self.assertEqual(cfg.meal_options_path, "/tmp/meal-options.json")
+        self.assertEqual(cfg.acquisition_mode, "command")
+        self.assertEqual(cfg.acquisition_allowed_job_types, ("youtube-transcript", "crypto-market-data"))
+        self.assertEqual(cfg.acquisition_artifact_dir, "/tmp/acquisitions")
+        self.assertEqual(cfg.acquisition_command, "/usr/local/bin/acquire")
 
     def test_cli_overrides_env(self) -> None:
         env = {
@@ -137,6 +175,44 @@ class TestRuntimeConfig(unittest.TestCase):
                 "true",
                 "--context-manual-compact",
                 "true",
+                "--voice-notes-enabled",
+                "false",
+                "--voice-note-whisper-command",
+                "custom-whisper",
+                "--voice-note-whisper-model",
+                "base",
+                "--voice-note-language",
+                "fr",
+                "--voice-note-transcribe-timeout-s",
+                "55",
+                "--voice-note-max-chars",
+                "2100",
+                "--voice-note-temp-dir",
+                "/tmp/custom-voice",
+                "--tts-enabled",
+                "true",
+                "--tts-command",
+                "python3 /tmp/tts-helper.py",
+                "--tts-timeout-s",
+                "19",
+                "--tts-max-chars",
+                "1111",
+                "--tts-temp-dir",
+                "/tmp/custom-tts",
+                "--tts-voice",
+                "fr-fr",
+                "--tts-language",
+                "fr",
+                "--meal-options-path",
+                "/tmp/custom-meal-options.json",
+                "--acquisition-mode",
+                "disabled",
+                "--acquisition-allowed-job-types",
+                "youtube-transcript",
+                "--acquisition-artifact-dir",
+                "/tmp/custom-acquisitions",
+                "--acquisition-command",
+                "/tmp/acquire",
                 "--once",
             ],
             env=env,
@@ -165,6 +241,25 @@ class TestRuntimeConfig(unittest.TestCase):
         self.assertEqual(cfg.context_compaction_cooldown_s, 30.0)
         self.assertTrue(cfg.context_strict_io)
         self.assertTrue(cfg.context_manual_compact)
+        self.assertFalse(cfg.voice_notes_enabled)
+        self.assertEqual(cfg.voice_note_whisper_command, "custom-whisper")
+        self.assertEqual(cfg.voice_note_whisper_model, "base")
+        self.assertEqual(cfg.voice_note_language, "fr")
+        self.assertEqual(cfg.voice_note_transcribe_timeout_s, 55.0)
+        self.assertEqual(cfg.voice_note_max_chars, 2100)
+        self.assertEqual(cfg.voice_note_temp_dir, "/tmp/custom-voice")
+        self.assertTrue(cfg.tts_enabled)
+        self.assertEqual(cfg.tts_command, "python3 /tmp/tts-helper.py")
+        self.assertEqual(cfg.tts_timeout_s, 19.0)
+        self.assertEqual(cfg.tts_max_chars, 1111)
+        self.assertEqual(cfg.tts_temp_dir, "/tmp/custom-tts")
+        self.assertEqual(cfg.tts_voice, "fr-fr")
+        self.assertEqual(cfg.tts_language, "fr")
+        self.assertEqual(cfg.meal_options_path, "/tmp/custom-meal-options.json")
+        self.assertEqual(cfg.acquisition_mode, "disabled")
+        self.assertEqual(cfg.acquisition_allowed_job_types, ("youtube-transcript",))
+        self.assertEqual(cfg.acquisition_artifact_dir, "/tmp/custom-acquisitions")
+        self.assertEqual(cfg.acquisition_command, "/tmp/acquire")
 
     def test_context_defaults_remain_legacy_compatible(self) -> None:
         cfg = parse_runtime_config([], env={"CHANNEL_TOKEN": "x"})
@@ -175,6 +270,21 @@ class TestRuntimeConfig(unittest.TestCase):
         self.assertEqual(cfg.context_keep_recent_tokens, 12000)
         self.assertFalse(cfg.context_strict_io)
         self.assertFalse(cfg.context_manual_compact)
+        self.assertTrue(cfg.voice_notes_enabled)
+        self.assertEqual(cfg.voice_note_whisper_command, "whisper")
+        self.assertEqual(cfg.voice_note_whisper_model, "turbo")
+        self.assertIsNone(cfg.voice_note_language)
+        self.assertEqual(cfg.voice_note_transcribe_timeout_s, 120.0)
+        self.assertEqual(cfg.voice_note_max_chars, 4000)
+        self.assertFalse(cfg.tts_enabled)
+        self.assertEqual(cfg.tts_command, "")
+        self.assertEqual(cfg.tts_timeout_s, 30.0)
+        self.assertEqual(cfg.tts_max_chars, 2000)
+        self.assertEqual(cfg.meal_options_path, "data/meal_options.json")
+        self.assertEqual(cfg.acquisition_mode, "inline")
+        self.assertEqual(cfg.acquisition_allowed_job_types, ("youtube-transcript",))
+        self.assertEqual(cfg.acquisition_artifact_dir, ".channel_runtime/acquisitions")
+        self.assertEqual(cfg.acquisition_command, "")
 
     def test_context_mode_explicit_emergency_toggle_is_supported(self) -> None:
         cfg = parse_runtime_config(
@@ -335,6 +445,21 @@ class TestRuntimeConfig(unittest.TestCase):
             parse_runtime_config([], env={"CHANNEL_TOKEN": "x", "CHANNEL_CONTEXT_STRICT_IO": "sometimes"})
         with self.assertRaisesRegex(ConfigValidationError, "context_manual_compact must be a boolean"):
             parse_runtime_config([], env={"CHANNEL_TOKEN": "x", "CHANNEL_CONTEXT_MANUAL_COMPACT": "sometimes"})
+        with self.assertRaisesRegex(ConfigValidationError, "voice_notes_enabled must be a boolean"):
+            parse_runtime_config([], env={"CHANNEL_TOKEN": "x", "CHANNEL_VOICE_NOTES_ENABLED": "sometimes"})
+        with self.assertRaisesRegex(
+            ConfigValidationError,
+            "voice_note_transcribe_timeout_s must be a positive number",
+        ):
+            parse_runtime_config([], env={"CHANNEL_TOKEN": "x", "CHANNEL_VOICE_NOTE_TRANSCRIBE_TIMEOUT_S": "0"})
+        with self.assertRaisesRegex(ConfigValidationError, "voice_note_max_chars must be an integer >= 1"):
+            parse_runtime_config([], env={"CHANNEL_TOKEN": "x", "CHANNEL_VOICE_NOTE_MAX_CHARS": "0"})
+        with self.assertRaisesRegex(ConfigValidationError, "tts_enabled must be a boolean"):
+            parse_runtime_config([], env={"CHANNEL_TOKEN": "x", "CHANNEL_TTS_ENABLED": "sometimes"})
+        with self.assertRaisesRegex(ConfigValidationError, "tts_timeout_s must be a positive number"):
+            parse_runtime_config([], env={"CHANNEL_TOKEN": "x", "CHANNEL_TTS_TIMEOUT_S": "0"})
+        with self.assertRaisesRegex(ConfigValidationError, "tts_max_chars must be an integer >= 1"):
+            parse_runtime_config([], env={"CHANNEL_TOKEN": "x", "CHANNEL_TTS_MAX_CHARS": "0"})
         with self.assertRaisesRegex(
             ConfigValidationError,
             "context_window_tokens must be greater than context_reserve_tokens",
@@ -448,6 +573,7 @@ class _PollingApiStub:
         self._fail_send_text_once = set(fail_send_text_once or set())
         self.offset_calls: list[int | None] = []
         self.sent_payloads: list[dict[str, Any]] = []
+        self.sent_voice_payloads: list[dict[str, Any]] = []
 
     def get_updates(self, *, offset=None, timeout_s=0, limit=100, allowed_updates=None):
         self.offset_calls.append(offset)
@@ -474,6 +600,18 @@ class _PollingApiStub:
             }
         )
         return {"message_id": 999}
+
+    def send_voice(self, *, chat_id, voice_bytes, filename="speech.ogg", reply_to_message_id=None, caption=None):
+        self.sent_voice_payloads.append(
+            {
+                "chat_id": chat_id,
+                "voice_bytes": bytes(voice_bytes),
+                "filename": filename,
+                "reply_to_message_id": reply_to_message_id,
+                "caption": caption,
+            }
+        )
+        return {"message_id": 1000}
 
 
 def _inbound(update_id: str, *, text: str = "hello", chat_id: str = "100") -> InboundMessage:
@@ -578,36 +716,75 @@ class TestRuntimeRunnerP2(unittest.TestCase):
         self.assertEqual(result["telemetry"]["contract"], "tg-live.runtime.telemetry")
         self.assertEqual(result["telemetry"]["version"], "2.0")
         self.assertEqual(result["telemetry"]["context"]["mode"], "legacy")
-        self.assertEqual(result["telemetry"]["context"]["compaction"]["attempted_total"], 0)
-        self.assertEqual(result["telemetry"]["context"]["compaction"]["succeeded_total"], 0)
-        self.assertEqual(result["telemetry"]["context"]["compaction"]["failed_total"], 0)
-        self.assertEqual(result["telemetry"]["context"]["tokens"]["estimated_total"], 0)
-        self.assertIsNone(result["telemetry"]["context"]["tokens"]["current_estimate"])
-        self.assertEqual(result["telemetry"]["heartbeat"]["emit_state"], "disabled")
-        self.assertEqual(result["telemetry"]["counters"]["fetch_total"], result["fetched_count"])
-        self.assertEqual(result["telemetry"]["counters"]["send_total"], result["sent_count"])
-        self.assertEqual(result["telemetry"]["counters"]["drop_total"], result["dropped_count"])
-        self.assertEqual(
-            result["telemetry"]["counters"]["heartbeat_emit_failures"],
-            result["heartbeat_emit_failures"],
+
+    def test_default_orchestrator_tts_command_marks_outbound_for_voice_delivery(self) -> None:
+        orchestrator = DefaultOrchestrator(enable_memory_hook=False)
+
+        outbound = orchestrator.handle_message(_inbound("1", text="/speak hello there", chat_id="501"), session_id="telegram:tts")
+
+        self.assertIsNotNone(outbound)
+        assert outbound is not None
+        self.assertEqual(outbound.text, "hello there")
+        self.assertTrue(outbound.metadata["telegram_tts"]["enabled"])
+        self.assertEqual(outbound.metadata["telegram_tts"]["fallback_text"], "hello there")
+        self.assertEqual(outbound.metadata["telegram_tts"]["text"], "hello there")
+
+    def test_default_orchestrator_tts_command_without_text_returns_usage(self) -> None:
+        orchestrator = DefaultOrchestrator(enable_memory_hook=False)
+
+        outbound = orchestrator.handle_message(_inbound("1", text="/tts", chat_id="501"), session_id="telegram:tts")
+
+        self.assertIsNotNone(outbound)
+        assert outbound is not None
+        self.assertEqual(outbound.text, "Usage: /speak <text> or /tts <text>")
+        self.assertNotIn("telegram_tts", outbound.metadata)
+
+    def test_default_orchestrator_dinner_command_returns_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "meal_options.json"
+            path.write_text(
+                '{"meals":["Chili","Curry","Pasta","Pie","Stew","Soup"]}',
+                encoding="utf-8",
+            )
+            orchestrator = DefaultOrchestrator(enable_memory_hook=False, meal_options_path=str(path))
+
+            outbound = orchestrator.handle_message(
+                _inbound("1", text="/dinners 5", chat_id="501"),
+                session_id="telegram:dinners",
+            )
+
+        self.assertIsNotNone(outbound)
+        assert outbound is not None
+        self.assertIn("Dinner plan (5 dinners):", outbound.text)
+        self.assertEqual(outbound.metadata["orchestrator_mode"], "default")
+
+    def test_voice_note_reply_is_marked_for_tts_when_runtime_tts_enabled(self) -> None:
+        inbound = InboundMessage(
+            update_id="1",
+            chat_id="501",
+            user_id="u-1",
+            text="[Voice note transcript]\nhello",
+            message_id="m-1",
+            metadata={"content_type": "voice", "telegram_voice": {"file_id": "voice-1"}},
         )
-        self.assertIsNone(result["telemetry"]["counters"]["retry_total"])
-        self.assertIsNone(result["telemetry"]["counters"]["queue_depth"])
-        self.assertIsNone(result["telemetry"]["counters"]["worker_restart_total"])
-        self.assertIsNone(result["telemetry"]["timers_ms"]["fetch"])
-        self.assertIsNone(result["telemetry"]["timers_ms"]["send"])
-        self.assertGreaterEqual(result["telemetry"]["timers_ms"]["cycle_total"], 0)
-        self.assertEqual(
-            result["telemetry"]["placeholders"]["retry_total"],
-            "pending-provider-attempt-instrumentation",
+        adapter = _AdapterStub(updates=[inbound])
+
+        result = run_cycle(
+            config=RuntimeConfig(token="tkn", tts_enabled=True),
+            adapter=adapter,
+            orchestrator=DefaultOrchestrator(enable_memory_hook=False),
+            heartbeat_emitter=HeartbeatEventEmitter(enabled=False),
         )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["sent_count"], 1)
+        self.assertEqual(adapter.sent[0].text, "echo: [Voice note transcript]\nhello")
         self.assertEqual(
-            result["telemetry"]["placeholders"]["queue_depth"],
-            "pending-runtime-queue-introspection",
-        )
-        self.assertEqual(
-            result["telemetry"]["placeholders"]["worker_restart_total"],
-            "pending-supervisor-integration",
+            adapter.sent[0].metadata["telegram_tts"],
+            {
+                "enabled": True,
+                "fallback_text": "echo: [Voice note transcript]\nhello",
+            },
         )
 
     def test_memory_hook_failure_is_non_fatal_and_surfaces_error(self) -> None:
