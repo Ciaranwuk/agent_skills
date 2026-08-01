@@ -34,6 +34,7 @@ def process_once(
     *,
     session_resolver: Callable[[InboundMessage], str] = session_id_for_inbound,
     ack_policy: str = "always",
+    trace: Callable[[str], None] | None = None,
 ) -> dict[str, object]:
     """
     Run one deterministic fetch/process/send/ack cycle.
@@ -46,9 +47,12 @@ def process_once(
     normalized_ack_policy = _normalize_ack_policy(ack_policy)
 
     try:
+        _trace(trace, "fetch:start")
         updates = adapter.fetch_updates()
+        _trace(trace, f"fetch:done count={len(updates)}")
     except Exception as exc:
         message = _sanitize_exception(exc)
+        _trace(trace, f"fetch:error {message}")
         return asdict(
             ProcessOnceResult(
                 status="failed",
@@ -68,13 +72,19 @@ def process_once(
 
     for inbound in updates:
         processed_ok = True
+        update_id = str(inbound.update_id)
+        _trace(trace, f"update:start update_id={update_id}")
         try:
             session_id = session_resolver(inbound)
+            _trace(trace, f"orchestrator:start update_id={update_id} session_id={session_id}")
             outbound = orchestrator.handle_message(inbound, session_id=session_id)
+            _trace(trace, f"orchestrator:done update_id={update_id}")
             if outbound is None:
                 pass
             elif isinstance(outbound, OutboundMessage):
+                _trace(trace, f"send:start update_id={update_id}")
                 adapter.send_message(outbound)
+                _trace(trace, f"send:done update_id={update_id}")
                 sent_count += 1
             else:
                 raise ChannelRuntimeError(
@@ -82,18 +92,25 @@ def process_once(
                 )
         except Exception as exc:
             processed_ok = False
-            errors.append(f"update {inbound.update_id}: {_sanitize_exception(exc)}")
+            message = _sanitize_exception(exc)
+            _trace(trace, f"update:error update_id={update_id} {message}")
+            errors.append(f"update {inbound.update_id}: {message}")
 
         should_ack = normalized_ack_policy == "always" or processed_ok
         if not should_ack:
             ack_skipped_count += 1
+            _trace(trace, f"ack:skipped update_id={update_id}")
             continue
 
         try:
+            _trace(trace, f"ack:start update_id={update_id}")
             adapter.ack_update(inbound.update_id)
+            _trace(trace, f"ack:done update_id={update_id}")
             acked_count += 1
         except Exception as exc:
-            errors.append(f"update {inbound.update_id}: ack failed: {_sanitize_exception(exc)}")
+            message = _sanitize_exception(exc)
+            _trace(trace, f"ack:error update_id={update_id} {message}")
+            errors.append(f"update {inbound.update_id}: ack failed: {message}")
 
     reason = "processed" if not errors else "completed-with-errors"
     return asdict(
@@ -114,6 +131,15 @@ def _sanitize_exception(exc: Exception) -> str:
     raw = f"{type(exc).__name__}: {exc}".strip()
     compact = " ".join(raw.split())
     return compact[:500]
+
+
+def _trace(trace: Callable[[str], None] | None, message: str) -> None:
+    if trace is None:
+        return
+    try:
+        trace(message)
+    except Exception:
+        return
 
 
 def _normalize_ack_policy(raw_policy: str) -> str:

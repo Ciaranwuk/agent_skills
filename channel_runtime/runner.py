@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -277,7 +278,14 @@ def run_cycle(
         return emitted
 
     try:
-        result = dict(process_once(resolved_adapter, gated_orchestrator, ack_policy=config.ack_policy))
+        result = dict(
+            process_once(
+                resolved_adapter,
+                gated_orchestrator,
+                ack_policy=config.ack_policy,
+                trace=_resolve_cycle_trace_fn(),
+            )
+        )
     except Exception as exc:
         message = _sanitize_exception(exc)
         context_telemetry = _drain_context_telemetry(gated_orchestrator, context_mode=config.context_mode)
@@ -441,6 +449,9 @@ def run_loop(
 
     while True:
         cycles += 1
+        trace = _resolve_cycle_trace_fn()
+        if trace is not None:
+            trace(f"cycle:start number={cycles}")
         try:
             last_result = dict(run_cycle_fn(config=config))
         except Exception as exc:
@@ -472,6 +483,13 @@ def run_loop(
 
         if on_cycle is not None:
             on_cycle(last_result)
+        if trace is not None:
+            trace(
+                "cycle:done "
+                f"number={cycles} status={last_result.get('status')} "
+                f"reason={last_result.get('reason')} fetched={last_result.get('fetched_count')} "
+                f"sent={last_result.get('sent_count')} acked={last_result.get('acked_count')}"
+            )
 
         if config.once:
             return last_result
@@ -480,6 +498,17 @@ def run_loop(
             return last_result
 
         sleep_fn(config.poll_interval_s)
+
+
+def _resolve_cycle_trace_fn() -> Callable[[str], None] | None:
+    raw = os.environ.get("CHANNEL_RUNTIME_TRACE_CYCLES", "")
+    if str(raw).strip().lower() not in {"1", "true", "yes", "on"}:
+        return None
+
+    def _trace(message: str) -> None:
+        print(f"[channel-runtime] {message}", file=sys.stderr, flush=True)
+
+    return _trace
 
 
 def _emit_best_effort_failure(

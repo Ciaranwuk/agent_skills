@@ -31,7 +31,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _emit_payload(payload: dict[str, object]) -> None:
-    print(json.dumps(dict(payload), sort_keys=True))
+    print(json.dumps(dict(payload), sort_keys=True), flush=True)
 
 
 def _exit_code_for_result(result: dict[str, object]) -> int:
