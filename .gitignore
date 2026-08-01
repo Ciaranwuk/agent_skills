@@ -1,4 +1,7 @@
 # Generated verification artifacts and Python bytecode caches.
 artifacts/
+incoming_untrusted/
+.channel_runtime/
 __pycache__/
 *.pyc
+.env.local

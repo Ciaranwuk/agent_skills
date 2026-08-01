@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram channel runtime
+After=network-online.target nss-lookup.target
+Wants=network-online.target nss-lookup.target
+
+[Service]
+Type=simple
+User=cwilson
+Group=cwilson
+WorkingDirectory=/home/cwilson/projects/agent_skills
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/cwilson/projects/agent_skills/scripts/run_channel_runtime_foreground.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
