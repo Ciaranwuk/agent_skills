@@ -234,6 +234,8 @@ Behavior:
 - Sleeps for `poll_interval_s` between cycles.
 - Continues running even if a cycle returns an error payload.
 - Stop with Ctrl+C (exit code `130`).
+- Because this is a foreground poll loop, a terminal that stays open here is expected; use the restart helper or systemd service for normal background operation.
+- If JSON output stops, restart with `CHANNEL_RUNTIME_TRACE_CYCLES=1 python3 -m channel_runtime`. Trace lines go to stderr and name the active stage (`fetch`, `orchestrator`, `send`, `ack`) without changing stdout JSON payload shape.
 
 ### Restart Helper (Apply Timeout Changes)
 
@@ -247,10 +249,48 @@ bash scripts/restart_channel_runtime.sh
 ```
 
 Behavior:
-- Reads the current shell environment and starts `python3 -m channel_runtime` with those values.
+- Reads the current shell environment and starts `scripts/run_channel_runtime_foreground.sh` with those values.
 - Uses `.channel_runtime/channel_runtime.pid` to find and stop the previous runtime process.
 - Stops with `SIGTERM` first; after a bounded wait it force-kills only if needed.
 - Writes runtime logs to `artifacts/channel_runtime/channel_runtime.log`.
+- Before starting, rotates an oversized log by renaming it with a timestamp suffix when it exceeds `CHANNEL_RUNTIME_LOG_MAX_BYTES` (`104857600` bytes by default; `0` disables rollover).
+- The foreground wrapper:
+  - loads `AGENT_SKILLS_ENV_FILE` when set, otherwise falls back to `agent_skills/.env.local`
+  - preserves already-exported shell env values
+  - runs DNS preflight for `api.telegram.org`, `openai.com`, and `www.youtube.com` before starting the runtime
+
+### Preferred Durable Install (`systemd`)
+
+Use systemd when the bot should survive shell exits and WSL restarts.
+
+1. Copy [`ops/systemd/telegram-channel-runtime.service`](/home/cwilson/projects/agent_skills/ops/systemd/telegram-channel-runtime.service) to `/etc/systemd/system/`.
+2. Ensure bot/runtime env is available either through:
+   - exported service environment values, or
+   - `AGENT_SKILLS_ENV_FILE` pointing at a readable env file outside the repo.
+3. Optional override example:
+
+```bash
+sudo systemctl edit telegram-channel-runtime.service
+```
+
+```ini
+[Service]
+Environment=AGENT_SKILLS_ENV_FILE=/home/cwilson/.config/agent_skills/channel_runtime.env
+```
+
+4. Restrict any host env file to the operator account, for example:
+   - `chmod 600 /home/cwilson/.config/agent_skills/channel_runtime.env`
+5. Run:
+   - `sudo systemctl daemon-reload`
+   - `sudo systemctl enable --now telegram-channel-runtime.service`
+6. Verify:
+   - `systemctl status telegram-channel-runtime.service`
+   - `journalctl -u telegram-channel-runtime.service -n 50 --no-pager`
+
+Behavior:
+- Runs the same foreground wrapper used by the manual restart helper.
+- Restarts automatically after non-zero exits and host restarts.
+- Refuses to come up cleanly when DNS preflight fails, which keeps the failure visible in `systemctl status`/`journalctl` instead of leaving a stale background bot process running indefinitely.
 
 ## 5) Payload and Exit Semantics
 

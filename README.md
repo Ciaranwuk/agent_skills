@@ -45,6 +45,16 @@ Run continuously:
 python3 -m channel_runtime
 ```
 
+This command is a foreground poll loop. It is healthy for it to keep the terminal occupied and emit one JSON payload per polling cycle; use Ctrl+C to stop it, or use the restart helper/systemd service below for normal background operation.
+
+If JSON output stops, restart with cycle tracing enabled to see the last completed stage on stderr while keeping stdout as JSON:
+
+```bash
+CHANNEL_RUNTIME_TRACE_CYCLES=1 python3 -m channel_runtime
+```
+
+Trace stages include fetch, orchestrator, send, and ack boundaries. If the final trace line is `fetch:start`, investigate Telegram networking; if it is `orchestrator:start`, investigate Codex/acquisition/voice-note processing for the referenced update; if it is `send:start`, investigate Telegram send/TTS.
+
 Apply a new Codex timeout in continuous mode:
 
 ```bash
@@ -54,6 +64,32 @@ bash scripts/restart_channel_runtime.sh
 
 `scripts/restart_channel_runtime.sh` gracefully stops the existing runtime process tracked in
 `.channel_runtime/channel_runtime.pid` and starts a new one with current environment values.
+
+Runtime launcher behavior:
+- `scripts/restart_channel_runtime.sh` starts `scripts/run_channel_runtime_foreground.sh` by default.
+- The foreground wrapper loads `AGENT_SKILLS_ENV_FILE` when set, otherwise falls back to `agent_skills/.env.local`.
+- Already-exported shell environment values are preserved instead of being overwritten by the env file.
+- DNS preflight runs before runtime startup for `api.telegram.org`, `openai.com`, and `www.youtube.com`.
+- Oversized restart-helper logs are rotated by timestamped rename when they exceed `CHANNEL_RUNTIME_LOG_MAX_BYTES` (`104857600` default; set `0` to disable rollover).
+
+Runtime launcher knobs:
+- `CHANNEL_RUNTIME_DNS_PREFLIGHT` (`true` default; accepts `true/false`, `1/0`, `yes/no`, `on/off`)
+- `CHANNEL_RUNTIME_DNS_PREFLIGHT_HOSTS` (comma- or space-separated host list)
+- `CHANNEL_RUNTIME_DNS_PREFLIGHT_PORT` (`443` default)
+- `CHANNEL_RUNTIME_LOG_MAX_BYTES` (`104857600` default)
+
+Preferred host install shape:
+- Copy [`ops/systemd/telegram-channel-runtime.service`](/home/cwilson/projects/agent_skills/ops/systemd/telegram-channel-runtime.service) to `/etc/systemd/system/`.
+- Ensure runtime env is available through exported service environment or `AGENT_SKILLS_ENV_FILE`.
+- Then run:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now telegram-channel-runtime.service
+sudo systemctl status telegram-channel-runtime.service
+```
+
+The service runs `scripts/run_channel_runtime_foreground.sh`, so manual `bash scripts/restart_channel_runtime.sh` and supervised startup share the same env-loading and DNS-preflight behavior.
 
 ## Telegram Context Management (P3)
 
