@@ -283,7 +283,7 @@ class TestRuntimeConfig(unittest.TestCase):
         self.assertEqual(cfg.meal_options_path, "data/meal_options.json")
         self.assertEqual(cfg.acquisition_mode, "inline")
         self.assertEqual(cfg.acquisition_allowed_job_types, ("youtube-transcript",))
-        self.assertEqual(cfg.acquisition_artifact_dir, ".channel_runtime/acquisitions")
+        self.assertEqual(cfg.acquisition_artifact_dir, "/mnt/d/agent_skills-offload/acquisitions")
         self.assertEqual(cfg.acquisition_command, "")
 
     def test_context_mode_explicit_emergency_toggle_is_supported(self) -> None:

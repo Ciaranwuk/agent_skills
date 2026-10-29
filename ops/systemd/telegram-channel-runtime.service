@@ -9,6 +9,11 @@ User=cwilson
 Group=cwilson
 WorkingDirectory=/home/cwilson/projects/agent_skills
 Environment=PYTHONUNBUFFERED=1
+Environment=CHANNEL_CODEX_ADD_DIRS=/mnt/d/agent_skills-offload,/mnt/d/crypto_fund_agents,/mnt/c/Users/ciara/OneDrive/Documents/llm_work_record
+Environment=CHANNEL_WHISPER_MODEL_DIR=/mnt/d/agent_skills-offload/whisper-models
+Environment=CHANNEL_VIDEO_TRANSCRIPTION_TEMP_DIR=/mnt/d/agent_skills-offload/video-transcription
+Environment=CHANNEL_VIDEO_WORK_DIR=/mnt/d/agent_skills-offload/video-work
+Environment=CHANNEL_ACQUISITION_ARTIFACT_DIR=/mnt/d/agent_skills-offload/acquisitions
 ExecStart=/home/cwilson/projects/agent_skills/scripts/run_channel_runtime_foreground.sh
 Restart=always
 RestartSec=10

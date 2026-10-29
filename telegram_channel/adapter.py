@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from pathlib import Path
 
 from channel_core.contracts import ChannelAdapterPort, ChannelRuntimeError, InboundMessage, OutboundMessage
 
@@ -9,6 +10,13 @@ from .cursor_state import CursorStateError, DurableCursorStateStore
 from .tts import TelegramTextToSpeechProcessor, TextToSpeechSynthesisError
 from .update_parser import parse_update
 from .voice_notes import TelegramVoiceNoteProcessor, VoiceNoteProcessingError
+
+TELEGRAM_MAX_MESSAGE_CHARS = 4096
+TELEGRAM_CHUNK_TARGET_CHARS = 3900
+LONG_MESSAGE_NOTICE = (
+    "I couldn't send that reply because it is too long for Telegram. "
+    "Please ask me to split it into shorter messages."
+)
 
 
 class TelegramChannelAdapter(ChannelAdapterPort):
@@ -92,6 +100,13 @@ class TelegramChannelAdapter(ChannelAdapterPort):
         return normalized
 
     def send_message(self, outbound: OutboundMessage) -> None:
+        photo_path = outbound.metadata.get("telegram_photo_path")
+        if photo_path:
+            self._send_photo(outbound, str(photo_path))
+            return
+        if len(outbound.text) > TELEGRAM_MAX_MESSAGE_CHARS:
+            self._send_message_chunks(outbound)
+            return
         if self._should_send_voice(outbound):
             self._send_text_to_speech(outbound)
             return
@@ -102,7 +117,82 @@ class TelegramChannelAdapter(ChannelAdapterPort):
                 reply_to_message_id=outbound.reply_to_message_id,
             )
         except TelegramApiError as exc:
+            if self._is_message_too_long_error(exc):
+                self._send_long_message_notice(outbound)
+                return
             raise ChannelRuntimeError(f"send_message failed: {exc.to_dict()}") from exc
+
+    def _send_photo(self, outbound: OutboundMessage, photo_path: str) -> None:
+        path = Path(photo_path)
+        try:
+            photo_bytes = path.read_bytes()
+            markup = outbound.metadata.get("telegram_reply_markup")
+            self._api.send_photo(
+                chat_id=outbound.chat_id,
+                photo_bytes=photo_bytes,
+                filename=path.name,
+                caption=outbound.text,
+                reply_to_message_id=outbound.reply_to_message_id,
+                reply_markup=markup if isinstance(markup, dict) else None,
+            )
+            callback_id = outbound.metadata.get("telegram_callback_query_id")
+            if callback_id:
+                self._api.answer_callback_query(callback_query_id=str(callback_id))
+        except TelegramApiError as exc:
+            raise ChannelRuntimeError(f"send_photo failed: {exc.to_dict()}") from exc
+        finally:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    def _send_message_chunks(self, outbound: OutboundMessage) -> None:
+        chunks = _split_telegram_message(outbound.text, TELEGRAM_CHUNK_TARGET_CHARS)
+        try:
+            for chunk in chunks:
+                self._api.send_message(
+                    chat_id=outbound.chat_id,
+                    text=chunk,
+                    reply_to_message_id=outbound.reply_to_message_id,
+                )
+            self._record_diagnostic(
+                code="reply-chunked",
+                message=(
+                    f"sent Telegram reply of {len(outbound.text)} characters in "
+                    f"{len(chunks)} chunks"
+                ),
+            )
+        except TelegramApiError as exc:
+            raise ChannelRuntimeError(f"send_message failed: {exc.to_dict()}") from exc
+
+    def _send_long_message_notice(self, outbound: OutboundMessage) -> None:
+        try:
+            self._api.send_message(
+                chat_id=outbound.chat_id,
+                text=LONG_MESSAGE_NOTICE,
+                reply_to_message_id=outbound.reply_to_message_id,
+            )
+            self._record_diagnostic(
+                code="reply-too-long",
+                message=(
+                    f"suppressed Telegram reply of {len(outbound.text)} characters; "
+                    "sent length-limit notice"
+                ),
+            )
+        except TelegramApiError as exc:
+            raise ChannelRuntimeError(f"send_message failed: {exc.to_dict()}") from exc
+
+    @staticmethod
+    def _is_message_too_long_error(exc: TelegramApiError) -> bool:
+        description = str(exc.description).lower()
+        return (
+            exc.error_code == 400
+            and (
+                "message is too long" in description
+                or "text is too long" in description
+                or "message text is too long" in description
+            )
+        )
 
     def ack_update(self, update_id: str) -> None:
         numeric_id = _to_int_update_id(update_id)
@@ -289,3 +379,28 @@ def _to_int_update_id(value: Any) -> int | None:
         return int(str(value).strip())
     except (TypeError, ValueError):
         return None
+
+
+def _split_telegram_message(text: str, target_chars: int) -> list[str]:
+    """Split text below Telegram's limit, preferring line and word boundaries."""
+    if not text:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > target_chars:
+        boundary = remaining.rfind("\n", 0, target_chars + 1)
+        if boundary <= 0:
+            boundary = remaining.rfind(" ", 0, target_chars + 1)
+        if boundary <= 0:
+            boundary = target_chars
+        chunk = remaining[:boundary]
+        chunks.append(chunk)
+        remaining = remaining[boundary:]
+        if remaining.startswith("\n"):
+            remaining = remaining[1:]
+        elif remaining.startswith(" "):
+            remaining = remaining[1:]
+    if remaining:
+        chunks.append(remaining)
+    return chunks

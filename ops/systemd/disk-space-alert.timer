@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the disk space Telegram alert check hourly
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+Persistent=true
+Unit=disk-space-alert.service
+
+[Install]
+WantedBy=timers.target

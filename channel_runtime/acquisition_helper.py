@@ -9,7 +9,7 @@ from io import StringIO
 from html.parser import HTMLParser
 from typing import Any, Mapping
 
-from channel_runtime.acquisition import YOUTUBE_TRANSCRIPT_JOB
+from channel_runtime.acquisition import GENERIC_VIDEO_TRANSCRIPT_JOB, YOUTUBE_TRANSCRIPT_JOB
 from channel_runtime.untrusted_artifacts import (
     DEFAULT_UNTRUSTED_INBOX,
     UntrustedArtifact,
@@ -24,10 +24,20 @@ from channel_runtime.youtube_transcript import (
     fetch_youtube_transcript,
     transcript_to_dict,
 )
+from channel_runtime.video_acquisition import (
+    VideoResolutionError,
+    find_vidalytics_settings_url,
+    resolve_public_video_page,
+    resolve_vidalytics_settings,
+)
+from channel_runtime.video_media import MediaConfig, download_media, extract_audio
+from channel_runtime.video_transcription import TranscriptionConfig, transcribe_audio
 
 _YOUTUBE_PROXY_HTTP_ENV = "CHANNEL_YOUTUBE_TRANSCRIPT_PROXY_HTTP_URL"
 _YOUTUBE_PROXY_HTTPS_ENV = "CHANNEL_YOUTUBE_TRANSCRIPT_PROXY_HTTPS_URL"
 _YOUTUBE_EXPORT_DIR_ENV = "CHANNEL_YOUTUBE_TRANSCRIPT_EXPORT_DIR"
+_VIDEO_WORK_DIR_ENV = "CHANNEL_VIDEO_WORK_DIR"
+_DEFAULT_VIDEO_WORK_DIR = "/mnt/d/agent_skills-offload/video-work"
 SOURCE_PAGE_JOB = "source-page"
 MARKETPLACE_SEARCH_JOB = "marketplace-search"
 _BRIDGE_TEXT_EXCERPT_LIMIT = 4000
@@ -44,7 +54,7 @@ class AcquisitionHelperError(RuntimeError):
 
 def build_response(request_payload: Mapping[str, Any]) -> dict[str, Any]:
     job_type = str(request_payload.get("job_type", "")).strip().lower()
-    if job_type not in {YOUTUBE_TRANSCRIPT_JOB, SOURCE_PAGE_JOB, MARKETPLACE_SEARCH_JOB}:
+    if job_type not in {YOUTUBE_TRANSCRIPT_JOB, GENERIC_VIDEO_TRANSCRIPT_JOB, SOURCE_PAGE_JOB, MARKETPLACE_SEARCH_JOB}:
         raise AcquisitionHelperError(
             code="unsupported-job-type",
             detail=f"unsupported acquisition job_type: {job_type or '<empty>'}",
@@ -86,6 +96,9 @@ def build_response(request_payload: Mapping[str, Any]) -> dict[str, Any]:
             ),
         }
 
+    if job_type == GENERIC_VIDEO_TRANSCRIPT_JOB:
+        return {"job_type": job_type, "artifact": _generic_video_payload(source_url)}
+
     if bridge_artifact is not None:
         return {
             "job_type": job_type,
@@ -124,6 +137,108 @@ def build_response(request_payload: Mapping[str, Any]) -> dict[str, Any]:
         "job_type": job_type,
         "artifact": transcript_to_dict(transcript),
     }
+
+
+def _generic_video_payload(source_url: str) -> dict[str, Any]:
+    """Run the bounded resolver/media/transcription stages for one public page."""
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+    from urllib.request import Request, urlopen
+
+    request = Request(source_url, headers={"User-Agent": "MissionControl/1.0"})
+    try:
+        with urlopen(request, timeout=30) as response:
+            html = response.read(2_000_000).decode("utf-8", errors="replace")
+    except Exception as exc:
+        raise AcquisitionHelperError(code="video-page-fetch-failed", detail=f"could not fetch video page: {type(exc).__name__}") from exc
+    try:
+        candidate = resolve_public_video_page(source_url=source_url, html=html)
+    except VideoResolutionError as exc:
+        if exc.code != "media-settings-required":
+            raise AcquisitionHelperError(code=exc.code, detail=str(exc)) from exc
+        try:
+            settings_url = find_vidalytics_settings_url(source_url=source_url, html=html)
+            if not settings_url:
+                raise VideoResolutionError("media-settings-required", "Vidalytics page exposes no player settings endpoint")
+            settings = _fetch_vidalytics_settings(settings_url)
+            candidate = resolve_vidalytics_settings(source_url=source_url, settings=settings)
+        except Exception as settings_exc:
+            code = getattr(settings_exc, "code", "video-settings-fetch-failed")
+            raise AcquisitionHelperError(code=code, detail=str(settings_exc)) from settings_exc
+    except Exception as exc:
+        code = getattr(exc, "code", "video-resolution-failed")
+        raise AcquisitionHelperError(code=code, detail=str(exc)) from exc
+
+    configured_work_dir = os.environ.get(_VIDEO_WORK_DIR_ENV, _DEFAULT_VIDEO_WORK_DIR).strip()
+    work_parent: Path | None = Path(configured_work_dir) if configured_work_dir else None
+    if work_parent is not None:
+        try:
+            work_parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            work_parent = None
+
+    with TemporaryDirectory(
+        prefix="mission-control-video-",
+        dir=str(work_parent) if work_parent is not None else None,
+    ) as tmp:
+        root = Path(tmp)
+        media_path = root / "media.mp4"
+        audio_path = root / "audio.wav"
+        try:
+            # An HLS URL is a playlist, not a media file. Let ffmpeg consume it
+            # directly so it can resolve segments under the same bounded policy.
+            media_input = candidate.media_url
+            if candidate.media_type == "mp4":
+                download_media(candidate, media_path)
+                media_input = media_path
+            # Long-form HLS sources can take longer than realtime to proxy and
+            # decode on CPU. Keep the operation bounded, but allow the full
+            # two-hour media limit and a correspondingly long transcription.
+            extract_audio(
+                candidate,
+                media_input,
+                audio_path,
+                config=MediaConfig(extraction_timeout_s=7_200),
+            )
+            artifact = transcribe_audio(
+                candidate,
+                audio_path,
+                root / "artifacts",
+                config=TranscriptionConfig(timeout_s=7_200),
+            )
+        except Exception as exc:
+            code = getattr(exc, "code", "generic-video-pipeline-failed")
+            raise AcquisitionHelperError(code=code, detail=str(exc)) from exc
+        payload = json.loads(artifact.artifact_path.read_text(encoding="utf-8"))
+        return payload
+
+
+def _fetch_vidalytics_settings(settings_url: str) -> Mapping[str, Any]:
+    """Fetch one bounded, public Vidalytics settings document."""
+    from urllib.request import Request, urlopen
+
+    request = Request(settings_url, headers={"User-Agent": "MissionControl/1.0"})
+    try:
+        with urlopen(request, timeout=30) as response:
+            raw = response.read(2_000_000)
+    except Exception as exc:
+        raise AcquisitionHelperError(
+            code="video-settings-fetch-failed",
+            detail=f"could not fetch Vidalytics settings: {type(exc).__name__}",
+        ) from exc
+    try:
+        settings = json.loads(raw.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AcquisitionHelperError(
+            code="video-settings-invalid-json",
+            detail="Vidalytics settings response was not valid UTF-8 JSON",
+        ) from exc
+    if not isinstance(settings, Mapping):
+        raise AcquisitionHelperError(
+            code="video-settings-invalid-payload",
+            detail="Vidalytics settings response must be a JSON object",
+        )
+    return settings
 
 
 def main(argv: list[str] | None = None) -> int:

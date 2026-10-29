@@ -55,7 +55,7 @@ class RuntimeConfig:
     meal_options_path: str = "data/meal_options.json"
     acquisition_mode: str = "inline"
     acquisition_allowed_job_types: tuple[str, ...] = ("youtube-transcript",)
-    acquisition_artifact_dir: str = ".channel_runtime/acquisitions"
+    acquisition_artifact_dir: str = "/mnt/d/agent_skills-offload/acquisitions"
     acquisition_command: str = ""
 
     def __post_init__(self) -> None:
@@ -185,7 +185,10 @@ def parse_runtime_config(
         "meal_options_path": source_env.get("CHANNEL_MEAL_OPTIONS_PATH", "data/meal_options.json"),
         "acquisition_mode": source_env.get("CHANNEL_ACQUISITION_MODE", "inline"),
         "acquisition_allowed_job_types": source_env.get("CHANNEL_ACQUISITION_ALLOWED_JOB_TYPES", "youtube-transcript"),
-        "acquisition_artifact_dir": source_env.get("CHANNEL_ACQUISITION_ARTIFACT_DIR", ".channel_runtime/acquisitions"),
+        "acquisition_artifact_dir": source_env.get(
+            "CHANNEL_ACQUISITION_ARTIFACT_DIR",
+            "/mnt/d/agent_skills-offload/acquisitions",
+        ),
         "acquisition_command": source_env.get("CHANNEL_ACQUISITION_COMMAND", ""),
     }
 
@@ -292,7 +295,10 @@ def parse_runtime_config(
             values["acquisition_allowed_job_types"],
             field_name="acquisition_allowed_job_types",
         ),
-        acquisition_artifact_dir=str(values["acquisition_artifact_dir"]).strip() or ".channel_runtime/acquisitions",
+        acquisition_artifact_dir=(
+            str(values["acquisition_artifact_dir"]).strip()
+            or "/mnt/d/agent_skills-offload/acquisitions"
+        ),
         acquisition_command=str(values["acquisition_command"]).strip(),
     )
 

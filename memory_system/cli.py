@@ -4,8 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from .api import memory_get, memory_search
-from .index import MemoryIndex
+from .api import memory_get, memory_rebuild, memory_search
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -17,6 +16,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="Additional markdown source root (repeatable). If omitted, only --workspace is scanned.",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=("builtin", "qmd"),
+        default="builtin",
+        help="Memory backend to use. get remains builtin-only; rebuild/search support builtin and draft qmd flows.",
     )
 
     sub = parser.add_subparsers(dest="command", required=True)
@@ -43,10 +48,15 @@ def main() -> int:
     workspace = Path(args.workspace).resolve()
 
     if args.command == "rebuild":
-        index = MemoryIndex(workspace=workspace, db_path=args.db, source_roots=args.source_root)
-        stats = index.sync(force=args.force)
-        print(json.dumps({"ok": True, "stats": stats}, sort_keys=True))
-        return 0
+        payload = memory_rebuild(
+            workspace=workspace,
+            db_path=args.db,
+            source_roots=args.source_root,
+            backend=args.backend,
+            force=args.force,
+        )
+        print(json.dumps(payload, sort_keys=True))
+        return 0 if bool(payload.get("ok")) else 1
 
     if args.command == "search":
         payload = memory_search(
@@ -56,11 +66,14 @@ def main() -> int:
             workspace=workspace,
             db_path=args.db,
             source_roots=args.source_root,
+            backend=args.backend,
         )
         print(json.dumps(payload, sort_keys=True))
         return 0
 
     if args.command == "get":
+        if args.backend != "builtin":
+            parser.error(f"backend '{args.backend}' is not available for get. memory_get stays Python-owned.")
         payload = memory_get(
             path=args.path,
             from_=args.from_,

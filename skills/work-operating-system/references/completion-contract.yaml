@@ -1,0 +1,50 @@
+contract_version: "1.0"
+completion:
+  work_item_id: "WI-YYYYMMDD-NNN"
+  claimed_outcome: ""
+  scope_result:
+    included_completed: []
+    excluded_or_deferred: []
+  changed_artifacts: []
+  validation_evidence:
+    checks: []
+    links: []
+  unresolved_risks: []
+  rollback_or_stop_state: ""
+  decision_owner: ""
+  decision: completed
+  durable_record: ""
+  next_action: ""
+
+decision_values:
+  - completed
+  - blocked
+  - escalated
+  - human_approval_required
+  - rejected
+
+gate_rules:
+  - id: outcome
+    rule: "claimed_outcome is specific and matches the declared scope"
+    failure_decision: blocked
+  - id: artifacts
+    rule: "changed_artifacts lists every material output and its path or external reference"
+    failure_decision: blocked
+  - id: evidence
+    rule: "validation_evidence is sufficient for the risk tier and acceptance criteria"
+    failure_decision: blocked
+  - id: risks
+    rule: "unresolved risks are explicit; consequential uncertainty is not silently accepted"
+    failure_decision: escalated
+  - id: authority
+    rule: "decision_owner and any required human approval are identified"
+    failure_decision: human_approval_required
+  - id: record
+    rule: "durable_record points to the session/work log or equivalent record"
+    failure_decision: blocked
+
+minimum_evidence_by_work_shape:
+  software: [changed_artifacts, tests_or_validation, unresolved_risks, durable_record]
+  research: [source_or_dataset_provenance, analysis_artifact, limitations, durable_record]
+  administration: [requested_state, resulting_state_or_blocker, privacy_check, durable_record]
+  general: [scope_result, validation_evidence, unresolved_risks, durable_record]

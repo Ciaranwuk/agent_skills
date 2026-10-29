@@ -1,0 +1,36 @@
+contract_version: "1.0"
+work_item:
+  work_item_id: "WI-YYYYMMDD-NNN"
+  title: ""
+  desired_outcome: ""
+  scope:
+    included: []
+    excluded: []
+  owner: ""
+  decision_owner: ""
+  risk_tier: low
+  permission_profile:
+    reads: [workspace]
+    local_writes: []
+    external_writes: []
+    consequential_actions: deny
+    human_approval_required: false
+  inputs: []
+  assumptions: []
+  constraints: []
+  dependencies: []
+  planned_artifacts: []
+  required_evidence: []
+  stop_conditions: []
+  rollback_plan: ""
+  escalation_rule: "Escalate when scope, authority, evidence, or safety is uncertain."
+  status: proposed
+  next_action: ""
+completion:
+  claimed_outcome: ""
+  changed_artifacts: []
+  validation_evidence: []
+  unresolved_risks: []
+  rollback_or_stop_state: ""
+  decision: completed
+  durable_record: ""

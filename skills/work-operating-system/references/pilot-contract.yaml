@@ -1,0 +1,10 @@
+contract_version: "1.0"
+pilot:
+  name: bounded-read-only-scout-observer
+  risk_tier: low
+  permission_profile: read_context_write_staged_proposal
+  allowed_actions: [read_declared_work_item, read_declared_history, write_new_staged_json_reports]
+  prohibited_actions: [mutate_work_items, change_code_or_data, send_external_messages, execute_consequential_actions, delete_or_overwrite_artifacts, expand_scope]
+  required_outputs: [scout_proposal.json, friction_report.json]
+  approval_boundary: human_decision_owner
+  default_next_state: human_approval_required

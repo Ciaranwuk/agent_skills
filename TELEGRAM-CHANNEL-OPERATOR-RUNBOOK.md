@@ -18,10 +18,11 @@ Provide operator-ready commands and triage guidance for the implemented Telegram
 - Additive runtime telemetry contract (`telemetry`) and heartbeat event digest cues.
 - Runtime digest (`runtime_digest`) context counters for per-cycle P3 triage.
 - TG-LIVE-E2 canary/smoke execution guidance for one-allowlisted-chat rollout.
+- Historical/diagnostic coverage for the retained YouTube transcript acquisition path.
 - Troubleshooting for auth, timeout/network, parse/unsupported, outbound, and allowlist cases.
 
 ### Non-Goals
-- No webhook, media, callback-query, or multi-channel operations.
+- No webhook, raw Telegram media ingestion, callback-query, or multi-channel operations.
 - No production deployment guidance.
 
 ## 2) Runtime Entry Point and Configuration
@@ -68,9 +69,47 @@ export CHANNEL_CODEX_TIMEOUT_S="20.0"
 # If true, codex orchestrator sends a minimal fallback user message on orchestrator errors/timeouts.
 export CHANNEL_NOTIFY_ON_ORCHESTRATOR_ERROR="false"
 
+# Codex CLI invocation controls for codex mode.
+# Default preserves: codex exec --sandbox workspace-write.
+# For scoped network config, set SANDBOX_MODE=config-default and DEFAULT_PERMISSIONS=workspace-network.
+export CHANNEL_CODEX_SANDBOX_MODE="workspace-write"
+export CHANNEL_CODEX_DEFAULT_PERMISSIONS=""
+export CHANNEL_CODEX_SEARCH="false"
+export CHANNEL_CODEX_PROFILE=""
+export CHANNEL_CODEX_MODEL="gpt-5.6-luna"
+
 # Codex session runtime lifecycle policy.
 export CHANNEL_CODEX_SESSION_MAX="128"
 export CHANNEL_CODEX_SESSION_IDLE_TTL_S="900.0"
+
+# Narrow privileged acquisition seam ahead of sandboxed codex exec:
+# - inline: runtime performs allowlisted acquisition directly
+# - command: runtime invokes one explicit host-side helper command
+# - disabled: pass inbound text through unchanged
+export CHANNEL_ACQUISITION_MODE="inline"
+
+# CSV allowlist of deterministic acquisition jobs. Default YouTube use case:
+export CHANNEL_ACQUISITION_ALLOWED_JOB_TYPES="youtube-transcript"
+
+# Where bounded local acquisition artifacts are written.
+export CHANNEL_ACQUISITION_ARTIFACT_DIR="/mnt/d/agent_skills-offload/acquisitions"
+
+# Optional command for command-mode acquisition. The helper must read one JSON request
+# from stdin and write one JSON response to stdout.
+export CHANNEL_ACQUISITION_COMMAND=""
+
+# Example repo-local helper:
+# export CHANNEL_ACQUISITION_COMMAND="python3 /home/cwilson/projects/agent_skills/scripts/run_channel_runtime_acquisition_helper.py"
+
+# Optional helper-only proxies for YouTube transcript fetches.
+# These are consumed only by the repo-local acquisition helper path.
+export CHANNEL_YOUTUBE_TRANSCRIPT_PROXY_HTTP_URL=""
+export CHANNEL_YOUTUBE_TRANSCRIPT_PROXY_HTTPS_URL=""
+
+# Optional destination for full transcript exports. When this is set, helper
+# requests can pass export_full_transcript=true and receive only metadata plus
+# the markdown path on stdout.
+export CHANNEL_YOUTUBE_TRANSCRIPT_EXPORT_DIR="/mnt/d/agent_skills-offload/youtube-transcripts"
 
 # Durable cursor state (update floor) persistence path; set empty string to disable persistence.
 export CHANNEL_CURSOR_STATE_PATH=".channel_runtime/telegram_cursor_state.json"
@@ -116,6 +155,156 @@ Effective defaults/behavior notes:
 - `CHANNEL_CONTEXT_STRICT_IO` only affects durable mode context-store load behavior.
 - `CHANNEL_CONTEXT_MANUAL_COMPACT=true` only takes effect in codex + durable mode.
 - `CHANNEL_CONTEXT_MIN_GAIN_TOKENS`, `CHANNEL_CONTEXT_COMPACTION_COOLDOWN_S`, and `CHANNEL_CONTEXT_SUMMARY_MAX_TOKENS` are parsed and validated but currently reserved for subsequent policy wiring; current codex durable runtime wiring uses `min_compaction_gain_tokens=0` and `cooldown_window_s=0.0`.
+- `CHANNEL_CODEX_SANDBOX_MODE=workspace-write` keeps the current spawned Codex sandbox. Use `config-default` to omit `--sandbox` so local Codex config such as `default_permissions = "workspace-network"` can apply. The runtime rejects `danger-full-access` through this env path.
+- `CHANNEL_CODEX_DEFAULT_PERMISSIONS=workspace-network` passes `-c default_permissions="workspace-network"` to the child Codex process when scoped network access is needed.
+- `CHANNEL_CODEX_SEARCH=true` passes top-level `--search` to Codex, enabling model web search without changing shell/Python network access.
+- `CHANNEL_CODEX_PROFILE` optionally passes `--profile <name>` for a separate Codex config profile.
+- `CHANNEL_CODEX_MODEL` sets the Telegram channel's first Codex model choice; it defaults to `gpt-5.6-luna`. Failed model invocations fall back to `gpt-5.4`, then to one invocation without `--model` so Codex can use its configured available model.
+- `CHANNEL_ACQUISITION_MODE=inline` keeps the privileged boundary narrow by performing only allowlisted deterministic acquisition in the parent runtime before handing text to sandboxed Codex.
+- `CHANNEL_ACQUISITION_MODE=command` is the preferred future shape for host-side helpers that need networked access but should return only bounded artifacts.
+- The current repo-local command helper only supports `youtube-transcript`, but this is no longer the recommended operator workflow for routine transcript retrieval.
+- Accepted current workflow: use Telegram only for lightweight capture/reminders, and do YouTube transcript retrieval plus Binance/API calls directly in this local Codex environment.
+- For full transcript capture, call the repo-local helper with `export_dir`, or set `CHANNEL_YOUTUBE_TRANSCRIPT_EXPORT_DIR` and pass `export_full_transcript=true`; the helper writes markdown and returns only metadata plus `export_path`.
+
+Legacy host dependency, only if the retained Telegram YouTube path is being re-tested:
+
+```bash
+python3 -m pip install youtube-transcript-api
+```
+
+Behavior notes:
+- This does not add Telegram media support; it only enriches plain-text messages that contain a YouTube URL.
+- If the dependency is missing or captions cannot be fetched, the runtime replies with a deterministic operator-facing message instead of a generic Codex failure.
+- If YouTube blocks transcript retrieval from the current host IP (`RequestBlocked`), prefer setting the helper-only proxy env vars above rather than widening general runtime proxy behavior or adding cookie auth first.
+- Treat this path as diagnostic or legacy-only unless there is a specific reason to re-open runtime-side network acquisition.
+
+Host acquisition bridge:
+
+Use this path when the sandboxed runtime cannot reach an external source directly. Trusted bridge code lives in `scripts/` and `channel_runtime/`; fetched material is untrusted and is written under `incoming_untrusted/acquisition_bridge/`. The runtime/helper then consumes those artifacts by metadata path or artifact ID.
+
+Run the offline dry-run before relying on the bridge:
+
+```bash
+python3 /home/cwilson/projects/agent_skills/scripts/host_acquisition_bridge_dry_run.py
+```
+
+Expected result: JSON with `ok: true`, `metadata_valid: true`, `checksum_valid: true`, `helper_consumed_artifact: true`, and `untrusted_warning_preserved: true`. This check does not use network access.
+
+Fetch a generic page artifact from a host shell with network access:
+
+```bash
+python3 /home/cwilson/projects/agent_skills/scripts/host_acquisition_fetcher.py \
+  --url "https://example.com/page" \
+  --job-type source-page
+```
+
+Fetch a YouTube transcript artifact from the host where `youtube-transcript-api` can reach YouTube:
+
+```bash
+python3 /home/cwilson/projects/agent_skills/scripts/host_acquisition_fetcher.py \
+  --url "https://youtu.be/dQw4w9WgXcQ" \
+  --job-type youtube-transcript
+```
+
+Capture a marketplace or job-count research artifact from a saved/exported result file:
+
+```bash
+python3 /home/cwilson/projects/agent_skills/scripts/host_acquisition_fetcher.py \
+  --url "https://example-marketplace.invalid/search?q=zapier+automation" \
+  --job-type marketplace-search \
+  --from-file /path/to/saved-search-results.html \
+  --mime-type text/html \
+  --marketplace "Example Marketplace" \
+  --query "zapier automation" \
+  --category "Zapier/Make workflow automation" \
+  --artifact-id freelance-zapier-search
+```
+
+CSV or JSON exports are also supported. Use `--mime-type text/csv` for CSV exports and `--mime-type application/json` for JSON summaries. Prefer including `--marketplace`, `--query`, and `--category` so later comparisons can group artifacts without inferring intent from page text.
+
+For an offline/dry-run handoff, write a local text file and pass it as a fixture:
+
+```bash
+python3 /home/cwilson/projects/agent_skills/scripts/host_acquisition_fetcher.py \
+  --url "https://youtu.be/dQw4w9WgXcQ" \
+  --job-type youtube-transcript \
+  --from-file /path/to/transcript.txt \
+  --artifact-id yt-demo
+```
+
+Then pass the returned `metadata_path` to the acquisition helper:
+
+```bash
+printf '%s' '{
+  "job_type": "youtube-transcript",
+  "source_url": "https://youtu.be/dQw4w9WgXcQ",
+  "bridge_metadata_path": "incoming_untrusted/acquisition_bridge/yt-demo/metadata.json"
+}' | python3 /home/cwilson/projects/agent_skills/scripts/run_channel_runtime_acquisition_helper.py
+```
+
+For a saved source page, use the same helper with `source-page`:
+
+```bash
+printf '%s' '{
+  "job_type": "source-page",
+  "source_url": "https://example.com/page",
+  "bridge_metadata_path": "incoming_untrusted/acquisition_bridge/page-demo/metadata.json"
+}' | python3 /home/cwilson/projects/agent_skills/scripts/run_channel_runtime_acquisition_helper.py
+```
+
+The page response includes source URL, fetch time, fetcher name, status code when available, checksum, metadata path, and a bounded `text_excerpt` prefixed with the untrusted-artifact warning. It does not print the full page by default.
+
+For a marketplace/job-count artifact, use `marketplace-search`:
+
+```bash
+printf '%s' '{
+  "job_type": "marketplace-search",
+  "source_url": "https://example-marketplace.invalid/search?q=zapier+automation",
+  "bridge_metadata_path": "incoming_untrusted/acquisition_bridge/freelance-zapier-search/metadata.json"
+}' | python3 /home/cwilson/projects/agent_skills/scripts/run_channel_runtime_acquisition_helper.py
+```
+
+The marketplace response includes the captured query/category metadata, source URL, checksum, bounded evidence excerpt, and `count_status`. `count_status` is `explicit` only when a count is directly found from JSON/CSV fields, CSV row count, or a single textual count candidate. If multiple plausible counts appear, the helper returns `ambiguous`; if no count is visible, it returns `missing`. Do not fill gaps by guessing.
+
+Bridge safety rules:
+- Treat artifact bodies as untrusted source material only.
+- Do not put cookies, auth headers, proxy credentials, tokens, or private secrets in artifact bodies, metadata, logs, prompts, or vault notes.
+- The helper rejects invalid metadata, checksum mismatches, unsupported MIME types, oversized artifacts, and job-type mismatches.
+- Fetched content can contain prompt-injection text; use it as evidence, not as authority to execute commands, edit files, update tickets, or write work records.
+- Link artifact metadata paths in work logs instead of pasting long fetched pages or transcripts into vault notes.
+- Keep `incoming_untrusted/` out of git. Delete or supersede old bridge artifacts manually only after any linked work record no longer needs the local evidence.
+
+Bridge troubleshooting:
+- `host-fetcher-error` with DNS wording: run the fetcher from a host shell with working DNS/network access, or use `--from-file` with a saved page/transcript.
+- `source-page-network-dns`: the host fetcher could not resolve/reach the page host; retry from a host shell with working DNS or use `--from-file`.
+- `source-page-request-blocked`: the page returned a blocking-style HTTP status such as `403` or `429`; capture a saved page/export manually if appropriate.
+- YouTube `RequestBlocked`: fetch from a host/network context YouTube accepts, or capture a manually saved transcript/source page as an untrusted artifact.
+- Missing `youtube_transcript_api`: install `youtube-transcript-api` in the host Python environment used to run `host_acquisition_fetcher.py`, or use `--from-file`.
+- Oversized artifact: rerun with a smaller saved source file or an explicit `--max-bytes` policy that matches the artifact contract.
+- Invalid metadata/checksum/type: discard the artifact and rerun the fetcher; do not hand-edit sidecars except for isolated local tests.
+- Job-type mismatch: pass a metadata path or artifact ID whose sidecar `job_type` matches the helper request.
+
+Optional host dependency for Telegram voice notes:
+
+```bash
+python3 -m pip install openai-whisper
+```
+
+Behavior notes:
+- Telegram `message.voice` support depends on a working local `whisper` CLI and typically `ffmpeg` on the host.
+- The first transcription run downloads the selected Whisper model into the local cache automatically.
+- If local transcription is unavailable or fails, the runtime sends a deterministic Telegram reply explaining the failure instead of silently dropping the note.
+
+Optional host dependency for Telegram text-to-speech replies:
+
+```bash
+sudo apt-get install ffmpeg espeak-ng
+```
+
+Behavior notes:
+- `/speak <text>` and `/tts <text>` request a spoken Telegram reply instead of a normal text reply.
+- Enable the feature with `CHANNEL_TTS_ENABLED=true` and point `CHANNEL_TTS_COMMAND` at `python3 /home/cwilson/projects/agent_skills/scripts/run_channel_runtime_tts_helper.py`.
+- Deterministic local helper failures fall back to plain text; transient Telegram voice-upload failures remain hard failures so `CHANNEL_ACK_POLICY=on-success` can retry safely.
 
 ### CLI Overrides
 Supported flags:
@@ -142,6 +331,20 @@ Supported flags:
 - `--context-compaction-cooldown-s <seconds>=0`
 - `--context-strict-io <boolean>`
 - `--context-manual-compact <boolean>`
+- `--voice-notes-enabled <boolean>`
+- `--voice-note-whisper-command <value>`
+- `--voice-note-whisper-model <value>`
+- `--voice-note-language <value>`
+- `--voice-note-transcribe-timeout-s <seconds>`
+- `--voice-note-max-chars <int>=1`
+- `--voice-note-temp-dir <path>`
+- `--tts-enabled <boolean>`
+- `--tts-command <value>`
+- `--tts-timeout-s <seconds>`
+- `--tts-max-chars <int>=1`
+- `--tts-temp-dir <path>`
+- `--tts-voice <value>`
+- `--tts-language <value>`
 - `--once`
 
 Unknown flags or missing values return an invalid-config failure payload and exit code `2`.
@@ -161,6 +364,10 @@ echo "CHANNEL_ACK_POLICY=${CHANNEL_ACK_POLICY:-always}"
 echo "CHANNEL_ORCHESTRATOR_MODE=${CHANNEL_ORCHESTRATOR_MODE:-default}"
 echo "CHANNEL_CODEX_TIMEOUT_S=${CHANNEL_CODEX_TIMEOUT_S:-20.0}"
 echo "CHANNEL_NOTIFY_ON_ORCHESTRATOR_ERROR=${CHANNEL_NOTIFY_ON_ORCHESTRATOR_ERROR:-false}"
+echo "CHANNEL_CODEX_SANDBOX_MODE=${CHANNEL_CODEX_SANDBOX_MODE:-workspace-write}"
+echo "CHANNEL_CODEX_DEFAULT_PERMISSIONS=${CHANNEL_CODEX_DEFAULT_PERMISSIONS:-<empty>}"
+echo "CHANNEL_CODEX_SEARCH=${CHANNEL_CODEX_SEARCH:-false}"
+echo "CHANNEL_CODEX_PROFILE=${CHANNEL_CODEX_PROFILE:-<empty>}"
 echo "CHANNEL_CODEX_SESSION_MAX=${CHANNEL_CODEX_SESSION_MAX:-128}"
 echo "CHANNEL_CODEX_SESSION_IDLE_TTL_S=${CHANNEL_CODEX_SESSION_IDLE_TTL_S:-900.0}"
 echo "CHANNEL_CURSOR_STATE_PATH=${CHANNEL_CURSOR_STATE_PATH:-.channel_runtime/telegram_cursor_state.json}"
@@ -175,6 +382,13 @@ echo "CHANNEL_CONTEXT_MIN_GAIN_TOKENS=${CHANNEL_CONTEXT_MIN_GAIN_TOKENS:-800}"
 echo "CHANNEL_CONTEXT_COMPACTION_COOLDOWN_S=${CHANNEL_CONTEXT_COMPACTION_COOLDOWN_S:-300}"
 echo "CHANNEL_CONTEXT_STRICT_IO=${CHANNEL_CONTEXT_STRICT_IO:-false}"
 echo "CHANNEL_CONTEXT_MANUAL_COMPACT=${CHANNEL_CONTEXT_MANUAL_COMPACT:-false}"
+echo "CHANNEL_VOICE_NOTES_ENABLED=${CHANNEL_VOICE_NOTES_ENABLED:-true}"
+echo "CHANNEL_VOICE_NOTE_WHISPER_COMMAND=${CHANNEL_VOICE_NOTE_WHISPER_COMMAND:-whisper}"
+echo "CHANNEL_VOICE_NOTE_WHISPER_MODEL=${CHANNEL_VOICE_NOTE_WHISPER_MODEL:-turbo}"
+echo "CHANNEL_VOICE_NOTE_LANGUAGE=${CHANNEL_VOICE_NOTE_LANGUAGE:-<empty>}"
+echo "CHANNEL_VOICE_NOTE_TRANSCRIBE_TIMEOUT_S=${CHANNEL_VOICE_NOTE_TRANSCRIBE_TIMEOUT_S:-120}"
+echo "CHANNEL_VOICE_NOTE_MAX_CHARS=${CHANNEL_VOICE_NOTE_MAX_CHARS:-4000}"
+echo "CHANNEL_VOICE_NOTE_TEMP_DIR=${CHANNEL_VOICE_NOTE_TEMP_DIR:-.channel_runtime/voice_notes}"
 ```
 
 ## 4) Run Commands
@@ -213,6 +427,20 @@ python3 -m channel_runtime \
   --context-compaction-cooldown-s "${CHANNEL_CONTEXT_COMPACTION_COOLDOWN_S:-300}" \
   --context-strict-io "${CHANNEL_CONTEXT_STRICT_IO:-false}" \
   --context-manual-compact "${CHANNEL_CONTEXT_MANUAL_COMPACT:-false}" \
+  --voice-notes-enabled "${CHANNEL_VOICE_NOTES_ENABLED:-true}" \
+  --voice-note-whisper-command "${CHANNEL_VOICE_NOTE_WHISPER_COMMAND:-whisper}" \
+  --voice-note-whisper-model "${CHANNEL_VOICE_NOTE_WHISPER_MODEL:-turbo}" \
+  --voice-note-language "${CHANNEL_VOICE_NOTE_LANGUAGE:-}" \
+  --voice-note-transcribe-timeout-s "${CHANNEL_VOICE_NOTE_TRANSCRIBE_TIMEOUT_S:-120}" \
+  --voice-note-max-chars "${CHANNEL_VOICE_NOTE_MAX_CHARS:-4000}" \
+  --voice-note-temp-dir "${CHANNEL_VOICE_NOTE_TEMP_DIR:-.channel_runtime/voice_notes}" \
+  --tts-enabled "${CHANNEL_TTS_ENABLED:-false}" \
+  --tts-command "${CHANNEL_TTS_COMMAND:-}" \
+  --tts-timeout-s "${CHANNEL_TTS_TIMEOUT_S:-30}" \
+  --tts-max-chars "${CHANNEL_TTS_MAX_CHARS:-2000}" \
+  --tts-temp-dir "${CHANNEL_TTS_TEMP_DIR:-.channel_runtime/tts}" \
+  --tts-voice "${CHANNEL_TTS_VOICE:-}" \
+  --tts-language "${CHANNEL_TTS_LANGUAGE:-}" \
   --live-mode "${CHANNEL_LIVE_MODE:-false}"
 ```
 
@@ -261,17 +489,16 @@ Behavior:
 
 ### Preferred Durable Install (`systemd`)
 
-Use systemd when the bot should survive shell exits and WSL restarts.
+Use a supervised host service for normal operation instead of relying on a manually started background shell.
 
+Install shape:
 1. Copy [`ops/systemd/telegram-channel-runtime.service`](/home/cwilson/projects/agent_skills/ops/systemd/telegram-channel-runtime.service) to `/etc/systemd/system/`.
 2. Ensure bot/runtime env is available either through:
-   - exported service environment values, or
-   - `AGENT_SKILLS_ENV_FILE` pointing at a readable env file outside the repo.
-3. Optional override example:
-
-```bash
-sudo systemctl edit telegram-channel-runtime.service
-```
+   - `/home/cwilson/projects/agent_skills/.env.local`, or
+   - a separate host env file referenced through `AGENT_SKILLS_ENV_FILE`
+3. If you use a separate host env file, prefer a systemd drop-in rather than editing the repo copy:
+   - `sudo systemctl edit telegram-channel-runtime.service`
+   - add:
 
 ```ini
 [Service]
@@ -324,10 +551,47 @@ export CHANNEL_CONTEXT_MANUAL_COMPACT="true"
 Commands:
 - `/ctx inspect` (alias: `/context inspect`)
 - `/ctx compact` (alias: `/context compact`)
+- `/runtime env`
+- `/runtime youtube-probe <youtube-url>` (alias: `/runtime youtube probe <youtube-url>`) for runtime-side diagnostics only
+- `/speak <text>` (alias: `/tts <text>`) for Telegram voice replies when TTS is enabled
 
 Expected outbound response format:
 - Prefix: `context inspect:` or `context compact:`
 - Fields: `session_id`, `status`, `reason`, `tokens_before`, `tokens_after`, `gained_tokens`, `turns_before`, `turns_after`
+- `/runtime env` returns:
+  - `status`
+  - `reason`
+  - `env_keys`
+  - `env_keys_set`
+  - `log_path`
+
+`/runtime env` behavior:
+- Writes one append-only JSON line to `artifacts/channel_runtime/runtime_env_diagnostics.log`.
+- Captures only a safe allowlist of runtime env keys:
+  - `AGENT_SKILLS_ENV_FILE`
+  - `PYTHONPATH`
+  - `CHANNEL_ACQUISITION_*`
+  - `CHANNEL_RUNTIME_*`
+  - proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` and lowercase variants)
+- Does not dump the full process environment or unrelated secrets over Telegram.
+
+`/runtime youtube-probe <youtube-url>` behavior:
+- Writes one append-only JSON line to `artifacts/channel_runtime/youtube_probe_diagnostics.log`.
+- Runs the YouTube transcript fetch path inside the live runtime process and logs:
+  - `pid`
+  - `cwd`
+  - `source_url`
+  - parsed `video_id`
+  - DNS resolution outcomes for `www.youtube.com`, `youtube.com`, and `youtu.be`
+  - the exact classified transcript error code or success summary from the helper stack
+- Telegram reply stays short and reports:
+  - `status`
+  - `reason`
+  - `probe_code`
+  - `video_id`
+  - `dns_failures`
+  - `log_path`
+- This command is intended to diagnose the retained runtime-side path, not to establish the default operator workflow for fetching transcripts.
 
 Typical status/reason combinations:
 - Inspect durable existing session: `status=ok reason=session-found`

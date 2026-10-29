@@ -21,12 +21,31 @@ def parse_update(raw_update: Mapping[str, Any]) -> ParsedTelegramUpdate:
     if update_id is None:
         return ParsedTelegramUpdate(update_id=None, inbound=None, skip_reason="invalid-update-id")
 
-    message = raw_update.get("message")
+    callback = raw_update.get("callback_query")
+    callback_sender: Mapping[str, Any] | None = None
+    if isinstance(callback, Mapping):
+        message = callback.get("message")
+        callback_sender = callback.get("from") if isinstance(callback.get("from"), Mapping) else None
+        callback_data = callback.get("data")
+        if isinstance(callback_data, str) and callback_data.startswith("trade:"):
+            raw_trade = callback_data.split(":", 1)[1].strip()
+            if raw_trade.isdigit():
+                message = dict(message) if isinstance(message, Mapping) else {}
+                message["text"] = f"/trade {raw_trade}"
+                raw_update = dict(raw_update)
+                raw_update["message"] = message
+                raw_update["_telegram_callback_query_id"] = _coerce_required_id(callback.get("id"))
+            else:
+                return ParsedTelegramUpdate(update_id=update_id, inbound=None, skip_reason="invalid-callback-data")
+        else:
+            return ParsedTelegramUpdate(update_id=update_id, inbound=None, skip_reason="unsupported-callback-data")
+    else:
+        message = raw_update.get("message")
     if not isinstance(message, Mapping):
         return ParsedTelegramUpdate(update_id=update_id, inbound=None, skip_reason="unsupported-update-type")
 
     chat = message.get("chat")
-    sender = message.get("from")
+    sender = callback_sender or message.get("from")
     chat_id = _coerce_required_id(chat.get("id") if isinstance(chat, Mapping) else None)
     user_id = _coerce_required_id(sender.get("id") if isinstance(sender, Mapping) else None)
     if chat_id is None or user_id is None:
@@ -34,6 +53,9 @@ def parse_update(raw_update: Mapping[str, Any]) -> ParsedTelegramUpdate:
 
     text = message.get("text")
     metadata: dict[str, Any] = {"source": "telegram", "update_type": "message", "content_type": "text"}
+    callback_query_id = raw_update.get("_telegram_callback_query_id")
+    if callback_query_id:
+        metadata["telegram_callback_query_id"] = callback_query_id
     inbound_text = text
     if not isinstance(text, str) or not text.strip():
         voice = message.get("voice")

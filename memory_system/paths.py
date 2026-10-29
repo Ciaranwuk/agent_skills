@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import posixpath
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -40,6 +42,13 @@ class DiscoveredFile:
     root: SourceRoot
 
 
+@dataclass(frozen=True)
+class QmdCollection:
+    name: str
+    root: SourceRoot
+    context: dict[str, str]
+
+
 def normalize_source_roots(workspace: Path, source_roots: Iterable[str | Path] | None = None) -> list[SourceRoot]:
     roots: list[Path] = [workspace.resolve()]
     for raw in source_roots or []:
@@ -67,11 +76,15 @@ def check_allowed_path(source_roots: list[SourceRoot], raw_path: str) -> PathChe
     rel_input = text
     if ":" in text:
         candidate_alias, rel_candidate = text.split(":", 1)
+        alias_prefix = candidate_alias == "workspace" or re.fullmatch(r"root\d+", candidate_alias) is not None
         for root in source_roots:
             if root.alias == candidate_alias:
                 selected_root = root
                 rel_input = rel_candidate
                 break
+        else:
+            if alias_prefix:
+                return PathCheck(False, text, error=DENY_ERROR)
 
     norm = posixpath.normpath(rel_input)
     if norm in {"", ".", ".."} or norm.startswith("../"):
@@ -127,6 +140,32 @@ def discover_markdown_files(source_roots: list[SourceRoot], excluded_dirs: set[s
     return discovered
 
 
+def build_qmd_collections(
+    workspace: Path,
+    source_roots: Iterable[str | Path] | None = None,
+) -> list[QmdCollection]:
+    workspace_path = workspace.resolve()
+    roots = normalize_source_roots(workspace_path, source_roots)
+    collections: list[QmdCollection] = []
+    for root in roots:
+        root_type = "workspace" if root.path == workspace_path else "source-root"
+        digest = hashlib.sha1(str(root.path).encode("utf-8")).hexdigest()[:10]
+        slug = _slugify_collection_component(root.path.name or root.alias)
+        name = f"memory-{slug}-{digest}"
+        collections.append(
+            QmdCollection(
+                name=name,
+                root=root,
+                context={
+                    "root_alias": root.alias,
+                    "root_type": root_type,
+                    "source_root": str(root.path),
+                },
+            )
+        )
+    return collections
+
+
 def _allowed_regular_file(root: Path, path: Path) -> bool:
     if not path.exists() or not path.is_file() or path.is_symlink():
         return False
@@ -159,3 +198,10 @@ def _canonical_key(root: SourceRoot, rel: str, multi_root: bool) -> str:
     if multi_root:
         return f"{root.alias}:{rel}"
     return rel
+
+
+def _slugify_collection_component(text: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    if not slug:
+        return "root"
+    return slug[:40]

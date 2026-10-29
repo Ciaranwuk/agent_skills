@@ -18,7 +18,9 @@ from channel_runtime.acquisition import (
     ACQUISITION_MODE_DISABLED,
     ACQUISITION_MODE_INLINE,
     AcquisitionDispatcherError,
+    GENERIC_VIDEO_TRANSCRIPT_JOB,
     PrivilegedAcquisitionDispatcher,
+    YOUTUBE_TRANSCRIPT_JOB,
 )
 from channel_runtime.youtube_transcript import YouTubeTranscript, YouTubeTranscriptError
 from channel_runtime.untrusted_artifacts import write_untrusted_artifact
@@ -46,6 +48,38 @@ def _write_fake_youtube_transcript_api(directory: Path, *, transcript_text: str)
 
 
 class PrivilegedAcquisitionDispatcherTests(unittest.TestCase):
+    def test_generic_video_url_routes_only_when_explicitly_allowlisted(self) -> None:
+        message = "review https://go.example.test/webinar"
+        disabled = PrivilegedAcquisitionDispatcher(
+            mode=ACQUISITION_MODE_COMMAND,
+            allowed_job_types=(YOUTUBE_TRANSCRIPT_JOB,),
+            command="python3 -c 'raise SystemExit(99)'",
+        )
+        self.assertEqual(disabled.prepare_message_text(message), message)
+
+    def test_generic_video_url_uses_command_contract_and_formats_transcript(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            helper_path = Path(tmpdir) / "generic_helper.py"
+            helper_path.write_text(
+                "import json, sys\n"
+                "request = json.load(sys.stdin)\n"
+                "json.dump({'job_type': request['job_type'], 'artifact': {"
+                "'source_url': request['source_url'], 'provider': 'vidalytics', "
+                "'transcript_text': 'bounded generic transcript', 'media_sha256': 'abc'}}, sys.stdout)\n",
+                encoding="utf-8",
+            )
+            dispatcher = PrivilegedAcquisitionDispatcher(
+                mode=ACQUISITION_MODE_COMMAND,
+                allowed_job_types=(GENERIC_VIDEO_TRANSCRIPT_JOB,),
+                artifact_root=tmpdir,
+                command=f"python3 {helper_path}",
+            )
+            prepared = dispatcher.prepare_message_text("please review https://go.example.test/webinar")
+            self.assertIn("bounded generic transcript", prepared)
+            self.assertIn("Provider: vidalytics", prepared)
+            payload = json.loads(next(Path(tmpdir).rglob("*.json")).read_text(encoding="utf-8"))
+            self.assertEqual(payload["job_type"], GENERIC_VIDEO_TRANSCRIPT_JOB)
+
     def test_disabled_mode_leaves_message_text_unchanged(self) -> None:
         dispatcher = PrivilegedAcquisitionDispatcher(mode=ACQUISITION_MODE_DISABLED)
         message = "review https://youtu.be/dQw4w9WgXcQ"

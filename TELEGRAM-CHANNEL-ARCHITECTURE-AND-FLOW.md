@@ -35,7 +35,20 @@ Scope: TG-LIVE behavior through D2/E2 and TG-CTX-P3 context management updates
   - Enriches service result with `dropped_updates`, `error_details`, `telemetry`.
 - `channel_runtime/codex_orchestrator.py`
   - Codex-backed `OrchestratorPort` implementation.
-  - Handles session lifecycle and classifies codex failures (`codex-timeout`, `codex-exec-failed`, etc).
+  - Handles session lifecycle, privileged acquisition-backed message preparation for allowlisted jobs, and codex failure classification (`codex-timeout`, `codex-exec-failed`, etc).
+- `channel_runtime/acquisition.py`
+  - Narrow privileged acquisition boundary ahead of sandboxed `codex exec`.
+  - Detects allowlisted jobs, writes bounded local artifacts, and returns prompt-safe text to the orchestrator.
+- `channel_runtime/acquisition_helper.py`
+  - Deterministic stdin/stdout helper contract for command-mode acquisition.
+  - Current retained path accepts only `youtube-transcript`.
+- `channel_runtime/youtube_transcript.py`
+  - Detects YouTube URLs in inbound text, fetches transcripts via `youtube_transcript_api`, and formats transcript-backed Codex prompts/artifacts.
+  - Returns deterministic operator-facing failures when transcript support is unavailable or captions cannot be fetched.
+  - This path remains implemented, but it is no longer the preferred operator workflow for routine transcript retrieval.
+- `telegram_channel/voice_notes.py`
+  - Resolves Telegram `message.voice` file metadata through the Bot API, downloads the audio, and invokes local `whisper` CLI transcription with bounded output.
+  - Maps missing local dependencies, Telegram fetch failures, timeout, and empty-transcript cases into deterministic operator-visible failures.
 - `channel_runtime/context/` (durable context subsystem in TG-CTX-P3)
   - `store.py`: JSONL transcript persistence + metadata with strict/non-strict corruption handling.
   - `assembler.py`: deterministic durable transcript to conversation-history assembly.
@@ -67,6 +80,10 @@ Config source precedence: CLI overrides env; env overrides defaults.
   - `CHANNEL_NOTIFY_ON_ORCHESTRATOR_ERROR` / `--notify-on-orchestrator-error` (boolean)
   - `CHANNEL_CODEX_SESSION_MAX` / `--codex-session-max` (int >= 1)
   - `CHANNEL_CODEX_SESSION_IDLE_TTL_S` / `--codex-session-idle-ttl-s` (>0)
+  - `CHANNEL_ACQUISITION_MODE` / `--acquisition-mode` (`disabled`, `inline`, or `command`)
+  - `CHANNEL_ACQUISITION_ALLOWED_JOB_TYPES` / `--acquisition-allowed-job-types` (CSV; default `youtube-transcript`)
+  - `CHANNEL_ACQUISITION_ARTIFACT_DIR` / `--acquisition-artifact-dir`
+  - `CHANNEL_ACQUISITION_COMMAND` / `--acquisition-command` (used only in `command` mode)
 - Live/allowlist:
   - `CHANNEL_ALLOWED_CHAT_IDS` / `--allowed-chat-ids` (CSV)
   - `CHANNEL_LIVE_MODE` / `--live-mode` (boolean; requires non-empty allowlist when true)
@@ -83,12 +100,31 @@ Config source precedence: CLI overrides env; env overrides defaults.
   - `CHANNEL_CONTEXT_COMPACTION_COOLDOWN_S` / `--context-compaction-cooldown-s` (default `300`)
   - `CHANNEL_CONTEXT_STRICT_IO` / `--context-strict-io` (default `false`)
   - `CHANNEL_CONTEXT_MANUAL_COMPACT` / `--context-manual-compact` (default `false`)
+- Voice notes:
+  - `CHANNEL_VOICE_NOTES_ENABLED` / `--voice-notes-enabled` (boolean; default `true`)
+  - `CHANNEL_VOICE_NOTE_WHISPER_COMMAND` / `--voice-note-whisper-command` (default `whisper`)
+  - `CHANNEL_VOICE_NOTE_WHISPER_MODEL` / `--voice-note-whisper-model` (default `turbo`)
+  - `CHANNEL_VOICE_NOTE_LANGUAGE` / `--voice-note-language` (optional)
+  - `CHANNEL_VOICE_NOTE_TRANSCRIBE_TIMEOUT_S` / `--voice-note-transcribe-timeout-s` (>0; default `120`)
+  - `CHANNEL_VOICE_NOTE_MAX_CHARS` / `--voice-note-max-chars` (int >= 1; default `4000`)
+  - `CHANNEL_VOICE_NOTE_TEMP_DIR` / `--voice-note-temp-dir` (default `.channel_runtime/voice_notes`)
+- Text to speech:
+  - `CHANNEL_TTS_ENABLED` / `--tts-enabled` (boolean; default `false`)
+  - `CHANNEL_TTS_COMMAND` / `--tts-command` (local helper command; default empty)
+  - `CHANNEL_TTS_TIMEOUT_S` / `--tts-timeout-s` (>0; default `30`)
+  - `CHANNEL_TTS_MAX_CHARS` / `--tts-max-chars` (int >= 1; default `2000`)
+  - `CHANNEL_TTS_TEMP_DIR` / `--tts-temp-dir` (default `.channel_runtime/tts`)
+  - `CHANNEL_TTS_VOICE` / `--tts-voice` (optional)
+  - `CHANNEL_TTS_LANGUAGE` / `--tts-language` (optional)
 
 Context defaults and current effective behavior:
 - Default mode remains `legacy`; durable store/compaction paths are disabled unless `CHANNEL_CONTEXT_MODE=durable`.
 - `CHANNEL_CONTEXT_STRICT_IO` is effective in durable mode (corruption/load behavior).
 - `CHANNEL_CONTEXT_MANUAL_COMPACT=true` enables `/ctx inspect` and `/ctx compact` interception in codex mode.
 - Current runtime wiring uses fixed compaction policy values (`min_compaction_gain_tokens=0`, `cooldown_window_s=0.0`) when constructing the codex durable orchestrator; parsed values for `CHANNEL_CONTEXT_MIN_GAIN_TOKENS`, `CHANNEL_CONTEXT_COMPACTION_COOLDOWN_S`, and `CHANNEL_CONTEXT_SUMMARY_MAX_TOKENS` are reserved for subsequent policy wiring.
+- Accepted workflow note:
+  - retain the acquisition seam as a narrow diagnostic/legacy boundary,
+  - but prefer direct local retrieval in this Codex environment for YouTube transcripts and other network-sensitive jobs such as Binance/API access.
 - Legacy emergency path retention contract (TG-CTX-P4-T03):
   - `CHANNEL_CONTEXT_MODE=legacy` is the explicit kill-switch for emergency rollback.
   - Retention window is one release cycle after 2026-03-05.
@@ -109,6 +145,8 @@ Telegram getUpdates
   -> channel_core.service.process_once
      -> session_id = "telegram:<chat_id>"
      -> channel_runtime runner orchestrator (default/codex) handle_message
+        -> optional retained privileged acquisition for allowlisted jobs (for example, YouTube transcript fetch during diagnostics)
+        -> write bounded local artifact if acquisition ran
      -> adapter.send_message (if outbound)
      -> adapter.ack_update (per ack_policy)
   -> channel_runtime.runner.run_cycle
@@ -122,6 +160,13 @@ Telegram getUpdates
 - Adapter fetch failure:
   - `process_once` returns `status=failed`, `reason=adapter-fetch-exception`.
   - `run_cycle` maps `error_details` and attempts heartbeat failure event.
+- YouTube transcript enrichment failure:
+  - Applies only to allowlisted acquisition paths, currently `message.text` payloads containing a YouTube URL.
+  - Missing dependency, invalid video ID, unusable captions, or command-mode helper failure return a direct operator reply and do not mutate transport/parser semantics.
+  - The operational fallback is to perform transcript retrieval directly in the local Codex environment rather than continuing to rely on the Telegram runtime path.
+- Voice-note processing failure:
+  - Applies only to Telegram `message.voice` payloads.
+  - Missing `whisper`, Telegram file lookup/download failure, timeout, or transcription failure return a direct operator reply and a diagnostic entry instead of silent drop.
 - Codex timeout/exec failure:
   - `CodexOrchestrator` records diagnostics (`codex-timeout` or `codex-exec-failed`).
   - If notify is disabled: no outbound fallback message.

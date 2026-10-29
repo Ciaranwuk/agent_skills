@@ -47,7 +47,7 @@ python3 -m memory_system --workspace "$WS" --source-root "$VAULT" get root1:deci
 
 ## CLI Usage
 ```bash
-python3 -m memory_system [--workspace <path>] [--source-root <path> ...] [--db <path>] <command> ...
+python3 -m memory_system [--workspace <path>] [--source-root <path> ...] [--db <path>] [--backend <builtin|qmd>] <command> ...
 ```
 
 Commands:
@@ -59,11 +59,20 @@ Notes:
 - `--workspace` defaults to `.`
 - `--source-root` is repeatable; when omitted, only `--workspace` is scanned
 - `--db` defaults to `<workspace>/.memory_index.sqlite`
+- `--backend` defaults to `builtin`
 - `search` returns a deterministic unavailable JSON payload if the local index is missing/unavailable
+- `search --backend qmd` is opt-in and now shells out to `qmd query --json`, normalizes results back to the builtin response shape, and falls back to builtin search when QMD is unavailable
+- `rebuild --backend qmd` now runs a Python-owned lifecycle adapter around the verified QMD Phase 1 commands: `qmd collection add`, `qmd update`, `qmd embed`, and `qmd status`
+- qmd subprocesses run with workspace-local `HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_DATA_HOME`, and `XDG_RUNTIME_DIR` rooted at `<workspace>/.qmd/`
+- `get` remains builtin-only; selecting `--backend qmd` there exits with an explicit operator-facing error
 - `get` accepts:
   - relative `*.md` paths (resolved against primary workspace root)
   - canonical multi-root keys (`rootN:relative/path.md`) for secondary roots
 - indexer skips common noisy directories: `.git`, `node_modules`, `.venv`, `venv`, `dist`, `build`, `__pycache__`
+- planned QMD collections are named deterministically from the resolved source-root path (`memory-<slug>-<hash>`), so collection identity does not depend on source-root ordering
+- QMD subprocesses now default their runtime home/config/cache/data under `<workspace>/.qmd/` so the adapter does not depend on writable `~/.config` or `~/.cache` paths
+- when QMD prerequisites are missing, `rebuild --backend qmd` returns deterministic actionable JSON and exit code `1`
+- when `search --backend qmd` falls back, the response stays builtin-shaped and includes a `fallback` object showing that QMD was requested but unavailable
 
 ## JSON Output Examples (current implementation)
 
@@ -96,6 +105,25 @@ Notes:
   "results": [],
   "unavailable": true,
   "warning": "Memory search is unavailable due to local index unavailability."
+}
+```
+
+### `memory_search` with requested QMD fallback
+```json
+{
+  "citations": "off",
+  "fallback": {
+    "details": [
+      "qmd binary not found on PATH"
+    ],
+    "reason": "memory index unavailable: qmd binary not found on PATH",
+    "requestedProvider": "qmd"
+  },
+  "mode": "fts-only",
+  "model": "",
+  "provider": "builtin",
+  "results": [],
+  "unavailable": true
 }
 ```
 

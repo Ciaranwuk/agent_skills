@@ -8,7 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from channel_core.contracts import ChannelRuntimeError, InboundMessage, OutboundMessage
-from telegram_channel.adapter import TelegramChannelAdapter
+from telegram_channel.adapter import LONG_MESSAGE_NOTICE, TelegramChannelAdapter, TELEGRAM_MAX_MESSAGE_CHARS
 from telegram_channel.api import TelegramApiError
 from telegram_channel.cursor_state import CursorStateError, CursorStateSnapshot, DurableCursorStateStore
 from telegram_channel.tts import TextToSpeechSynthesisError
@@ -70,6 +70,24 @@ class _ApiSendFailureStub(_ApiStub):
             description="telegram unavailable",
             status_code=503,
             retry_class="transient",
+        )
+
+
+class _ApiTooLongFailureStub(_ApiStub):
+    def send_message(self, *, chat_id, text, reply_to_message_id=None):
+        if text != LONG_MESSAGE_NOTICE:
+            raise TelegramApiError(
+                operation="sendMessage",
+                kind="http-error",
+                transient=False,
+                description="Bad Request: message is too long",
+                status_code=400,
+                error_code=400,
+            )
+        return super().send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_to_message_id=reply_to_message_id,
         )
 
 
@@ -301,6 +319,29 @@ class TestTelegramAdapter(unittest.TestCase):
         self.assertEqual(
             api.sent_payloads,
             [{"chat_id": "55", "text": "hi", "reply_to_message_id": "3"}],
+        )
+
+    def test_oversized_reply_is_sent_in_telegram_safe_chunks(self) -> None:
+        api = _ApiStub([[]])
+        adapter = TelegramChannelAdapter(api)
+        text = "\n".join(f"line {index}" for index in range(700))
+
+        adapter.send_message(OutboundMessage(chat_id="55", text=text, reply_to_message_id="3"))
+
+        self.assertGreater(len(api.sent_payloads), 1)
+        self.assertEqual("\n".join(str(item["text"]) for item in api.sent_payloads), text)
+        self.assertTrue(all(len(str(item["text"])) <= TELEGRAM_MAX_MESSAGE_CHARS for item in api.sent_payloads))
+        self.assertTrue(any(item.get("code") == "reply-chunked" for item in adapter.drain_diagnostics()))
+
+    def test_api_length_error_sends_length_notice(self) -> None:
+        api = _ApiTooLongFailureStub([[]])
+        adapter = TelegramChannelAdapter(api)
+
+        adapter.send_message(OutboundMessage(chat_id="55", text="reply", reply_to_message_id="3"))
+
+        self.assertEqual(
+            api.sent_payloads,
+            [{"chat_id": "55", "text": LONG_MESSAGE_NOTICE, "reply_to_message_id": "3"}],
         )
 
     def test_send_message_api_error_is_wrapped_deterministically(self) -> None:

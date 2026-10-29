@@ -62,8 +62,10 @@ _RUNTIME_ENV_ALLOWLIST = (
     "CHANNEL_RUNTIME_STOP_WAIT_S",
     "CHANNEL_CODEX_SANDBOX_MODE",
     "CHANNEL_CODEX_DEFAULT_PERMISSIONS",
+    "CHANNEL_CODEX_ADD_DIRS",
     "CHANNEL_CODEX_SEARCH",
     "CHANNEL_CODEX_PROFILE",
+    "CHANNEL_CODEX_MODEL",
     "ALL_PROXY",
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -78,6 +80,8 @@ _CODEX_SANDBOX_MODES = frozenset({"read-only", "workspace-write"})
 _CODEX_OMIT_SANDBOX_VALUES = frozenset({"", "config-default", "default", "none", "omit"})
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off", ""})
+_DEFAULT_CODEX_MODEL = "gpt-5.6-luna"
+_PREFERRED_CODEX_FALLBACK_MODEL = "gpt-5.4"
 
 
 @dataclass(frozen=True)
@@ -1093,30 +1097,48 @@ def _default_codex_invoke(request: CodexInvocationRequest, *, timeout_s: float) 
         },
         sort_keys=True,
     )
-    try:
-        completed = subprocess.run(
-            _build_codex_exec_args(codex_cwd=codex_cwd, payload=payload, env=os.environ),
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise TimeoutError("codex invocation timed out") from exc
-    except OSError as exc:
-        raise CodexExecError(str(exc) or "codex invocation failed") from exc
-    if completed.returncode != 0:
-        stderr = (completed.stderr or "").strip() or "codex invocation failed"
-        raise CodexExecError(stderr)
-    output = (completed.stdout or "").strip()
-    return output or None
+    last_error = "codex invocation failed"
+    for model in _codex_model_candidates(os.environ):
+        try:
+            completed = subprocess.run(
+                _build_codex_exec_args(codex_cwd=codex_cwd, payload=payload, env=os.environ, model=model),
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError("codex invocation timed out") from exc
+        except OSError as exc:
+            raise CodexExecError(str(exc) or "codex invocation failed") from exc
+        if completed.returncode == 0:
+            output = (completed.stdout or "").strip()
+            return output or None
+        last_error = (completed.stderr or "").strip() or "codex invocation failed"
+    raise CodexExecError(last_error)
 
 
-def _build_codex_exec_args(*, codex_cwd: str, payload: str, env: Mapping[str, str]) -> list[str]:
+def _codex_model_candidates(env: Mapping[str, str]) -> tuple[str | None, ...]:
+    configured = str(env.get("CHANNEL_CODEX_MODEL", _DEFAULT_CODEX_MODEL)).strip()
+    preferred = configured or _DEFAULT_CODEX_MODEL
+    candidates: list[str | None] = [preferred]
+    if _PREFERRED_CODEX_FALLBACK_MODEL not in candidates:
+        candidates.append(_PREFERRED_CODEX_FALLBACK_MODEL)
+    candidates.append(None)
+    return tuple(candidates)
+
+
+def _build_codex_exec_args(
+    *, codex_cwd: str, payload: str, env: Mapping[str, str], model: str | None = _DEFAULT_CODEX_MODEL
+) -> list[str]:
     args = ["codex"]
     if _parse_env_bool(env.get("CHANNEL_CODEX_SEARCH"), default=False, field_name="CHANNEL_CODEX_SEARCH"):
         args.append("--search")
     args.append("exec")
+
+    resolved_model = str(model).strip() if model is not None else ""
+    if resolved_model:
+        args.extend(["--model", resolved_model])
 
     profile = str(env.get("CHANNEL_CODEX_PROFILE", "")).strip()
     if profile:
@@ -1126,12 +1148,34 @@ def _build_codex_exec_args(*, codex_cwd: str, payload: str, env: Mapping[str, st
     if default_permissions:
         args.extend(["-c", f"default_permissions={json.dumps(default_permissions)}"])
 
+    for directory in _codex_add_dirs(env.get("CHANNEL_CODEX_ADD_DIRS")):
+        args.extend(["--add-dir", directory])
+
     sandbox_mode = _codex_sandbox_mode(env.get("CHANNEL_CODEX_SANDBOX_MODE"))
     if sandbox_mode is not None:
         args.extend(["--sandbox", sandbox_mode])
 
     args.extend(["--skip-git-repo-check", "--cd", codex_cwd, payload])
     return args
+
+
+def _codex_add_dirs(raw_value: str | None) -> tuple[str, ...]:
+    """Parse the explicit list of extra writable directories for Codex exec."""
+    if raw_value is None or not str(raw_value).strip():
+        return ()
+
+    directories: list[str] = []
+    for raw_directory in str(raw_value).split(","):
+        directory = raw_directory.strip()
+        if not directory:
+            raise CodexExecError("Invalid CHANNEL_CODEX_ADD_DIRS; entries must not be empty")
+        if not Path(directory).is_absolute():
+            raise CodexExecError(
+                f"Invalid CHANNEL_CODEX_ADD_DIRS entry {directory!r}; paths must be absolute"
+            )
+        if directory not in directories:
+            directories.append(directory)
+    return tuple(directories)
 
 
 def _codex_sandbox_mode(raw_value: str | None) -> str | None:

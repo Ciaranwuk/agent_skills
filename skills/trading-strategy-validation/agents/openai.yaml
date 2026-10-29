@@ -1,0 +1,4 @@
+interface:
+  display_name: "Trading Strategy Validation"
+  short_description: "Formal strategy testing pipeline"
+  default_prompt: "Use $trading-strategy-validation to validate a crypto trading strategy and produce decision-ready artifacts."

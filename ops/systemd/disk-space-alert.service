@@ -1,0 +1,14 @@
+[Unit]
+Description=Check disk space and send a Telegram alert
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=cwilson
+Group=cwilson
+WorkingDirectory=/home/cwilson/projects/agent_skills
+Environment=PYTHONUNBUFFERED=1
+Environment=DISK_ALERT_CHAT_ID=5946121750
+Environment=DISK_ALERT_PATH=/mnt/c
+ExecStart=/home/cwilson/projects/agent_skills/scripts/run_disk_space_alert.sh

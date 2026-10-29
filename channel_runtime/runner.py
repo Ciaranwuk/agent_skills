@@ -22,6 +22,7 @@ from .config import RuntimeConfig
 from .context.compaction import CompactionPolicy, CompactionService
 from .context.store import ContextStore
 from .dinner_selector import build_dinner_command_response
+from .trade_explorer import build_trade_response
 from .acquisition import PrivilegedAcquisitionDispatcher
 
 
@@ -128,6 +129,39 @@ class DefaultOrchestrator:
         diagnostics = list(self._diagnostics)
         self._diagnostics.clear()
         return diagnostics
+
+
+class TradeExplorerOrchestrator:
+    """Handle the local V3 trade explorer before delegating normal chat messages."""
+
+    def __init__(self, delegate: OrchestratorPort) -> None:
+        self._delegate = delegate
+
+    def handle_message(self, inbound: InboundMessage, *, session_id: str) -> OutboundMessage | None:
+        result = build_trade_response(inbound.text, chat_id=inbound.chat_id, message_id=inbound.message_id)
+        if result is None:
+            return self._delegate.handle_message(inbound, session_id=session_id)
+        metadata: dict[str, Any] = {"session_id": session_id}
+        if result.get("photo_path"):
+            metadata["telegram_photo_path"] = result["photo_path"]
+            metadata["telegram_reply_markup"] = result.get("reply_markup")
+        callback_id = inbound.metadata.get("telegram_callback_query_id")
+        if callback_id:
+            metadata["telegram_callback_query_id"] = callback_id
+        return OutboundMessage(
+            chat_id=inbound.chat_id,
+            text=str(result.get("text", "Trade explorer error")),
+            reply_to_message_id=inbound.message_id,
+            metadata=metadata,
+        )
+
+    def drain_diagnostics(self) -> list[dict[str, Any]]:
+        drain = getattr(self._delegate, "drain_diagnostics", None)
+        return drain() if callable(drain) else []
+
+    def drain_context_telemetry(self) -> dict[str, Any]:
+        drain = getattr(self._delegate, "drain_context_telemetry", None)
+        return drain() if callable(drain) else {}
 
 
 class AllowlistGateOrchestrator:
@@ -301,6 +335,7 @@ def run_cycle(
         resolved_orchestrator,
         enabled=config.tts_enabled,
     )
+    resolved_orchestrator = TradeExplorerOrchestrator(resolved_orchestrator)
     emitter = heartbeat_emitter or HeartbeatEventEmitter()
     heartbeat_emit_attempts = 0
     heartbeat_emit_failures = 0

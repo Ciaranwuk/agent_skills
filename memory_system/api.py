@@ -3,11 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .index import MemoryIndex
+from .backend import resolve_search_backend
 from .paths import DENY_ERROR, check_allowed_path, normalize_source_roots
-
-SEARCH_WARNING = "Memory search is unavailable due to local index unavailability."
-SEARCH_ACTION = "Rebuild local memory index and retry memory_search."
+from .qmd_adapter import QmdLifecycleAdapter
+from .index import MemoryIndex
 
 
 def memory_search(
@@ -18,6 +17,7 @@ def memory_search(
     workspace: str | Path,
     db_path: str | Path | None = None,
     source_roots: list[str | Path] | None = None,
+    backend: str | Any | None = None,
 ) -> dict[str, Any]:
     query_text = (query or "").strip()
     if not query_text:
@@ -29,38 +29,13 @@ def memory_search(
         raise ValueError("maxResults must be between 1 and 50")
     if min_score < 0.0 or min_score > 1.0:
         raise ValueError("minScore must be between 0 and 1")
-    index = MemoryIndex(workspace=workspace, db_path=db_path, source_roots=source_roots)
-
-    available, reason = index.is_available()
-    if not available:
-        return {
-            "results": [],
-            "disabled": True,
-            "unavailable": True,
-            "error": f"memory index unavailable: {reason}",
-            "warning": SEARCH_WARNING,
-            "action": SEARCH_ACTION,
-        }
-
-    try:
-        rows = index.search(query_text, max_results=max_results, min_score=min_score)
-    except Exception as exc:  # deterministic unavailable contract on runtime failures
-        return {
-            "results": [],
-            "disabled": True,
-            "unavailable": True,
-            "error": f"memory index unavailable: {exc}",
-            "warning": SEARCH_WARNING,
-            "action": SEARCH_ACTION,
-        }
-
-    return {
-        "results": rows,
-        "provider": "builtin",
-        "model": "",
-        "citations": "off",
-        "mode": "fts-only",
-    }
+    search_backend = resolve_search_backend(
+        backend,
+        workspace=workspace,
+        db_path=db_path,
+        source_roots=source_roots,
+    )
+    return search_backend.search(query_text, max_results=max_results, min_score=min_score)
 
 
 def memory_get(
@@ -138,3 +113,20 @@ def memory_get(
         sliced = items[begin : begin + line_count]
 
     return {"path": rel, "text": "".join(sliced)}
+
+
+def memory_rebuild(
+    *,
+    workspace: str | Path,
+    db_path: str | Path | None = None,
+    source_roots: list[str | Path] | None = None,
+    backend: str | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    if backend is None or backend == "builtin":
+        index = MemoryIndex(workspace=workspace, db_path=db_path, source_roots=source_roots)
+        return {"ok": True, "stats": index.sync(force=force)}
+    if backend == "qmd":
+        adapter = QmdLifecycleAdapter(workspace=workspace, source_roots=source_roots)
+        return adapter.rebuild(force=force)
+    raise ValueError(f"unsupported memory rebuild backend: {backend}")

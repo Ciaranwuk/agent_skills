@@ -2,6 +2,12 @@
 artifacts/
 incoming_untrusted/
 .channel_runtime/
+.runtime/
+.runtime
 __pycache__/
 *.pyc
+*.sqlite
+*.db
+.qmd/
+context/
 .env.local

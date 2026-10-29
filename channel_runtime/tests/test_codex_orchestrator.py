@@ -1100,15 +1100,113 @@ class TestDefaultCodexInvoke(unittest.TestCase):
         run_mock.assert_called_once()
         args = run_mock.call_args.args[0]
         self.assertEqual(args[0:2], ["codex", "exec"])
-        self.assertEqual(args[2:4], ["--sandbox", "workspace-write"])
-        self.assertEqual(args[4], "--skip-git-repo-check")
-        self.assertEqual(args[5], "--cd")
-        self.assertEqual(args[6], "/home/cwilson/projects")
+        self.assertEqual(args[2:4], ["--model", "gpt-5.6-luna"])
+        self.assertEqual(args[4:6], ["--sandbox", "workspace-write"])
+        self.assertEqual(args[6], "--skip-git-repo-check")
+        self.assertEqual(args[7], "--cd")
+        self.assertEqual(args[8], "/home/cwilson/projects")
         self.assertNotIn("--search", args)
         self.assertNotIn("--profile", args)
         self.assertNotIn("-c", args)
-        self.assertEqual(json.loads(args[7])["text"], "hello")
+        self.assertEqual(json.loads(args[9])["text"], "hello")
         self.assertEqual(run_mock.call_args.kwargs["timeout"], 3.0)
+
+    def test_invokes_codex_with_configured_additional_writable_directories(self) -> None:
+        request = CodexInvocationRequest(
+            session_id="telegram:100",
+            chat_id="100",
+            user_id="u-1",
+            text="hello",
+            update_id="1",
+            message_id="m-1",
+            conversation_history=(),
+        )
+        env = {
+            "CHANNEL_CODEX_ADD_DIRS": "/mnt/d,/mnt/c/Users/ciara/OneDrive/Documents/llm_work_record",
+        }
+
+        with mock.patch.dict("channel_runtime.codex_orchestrator.os.environ", env, clear=True), mock.patch(
+            "channel_runtime.codex_orchestrator.subprocess.run"
+        ) as run_mock:
+            run_mock.return_value = mock.Mock(returncode=0, stdout="ok\n", stderr="")
+            _default_codex_invoke(request, timeout_s=3.0)
+
+        args = run_mock.call_args.args[0]
+        self.assertEqual(
+            args[4:8],
+            [
+                "--add-dir",
+                "/mnt/d",
+                "--add-dir",
+                "/mnt/c/Users/ciara/OneDrive/Documents/llm_work_record",
+            ],
+        )
+
+    def test_rejects_relative_additional_writable_directory(self) -> None:
+        request = CodexInvocationRequest(
+            session_id="telegram:100",
+            chat_id="100",
+            user_id="u-1",
+            text="hello",
+            update_id="1",
+            message_id="m-1",
+            conversation_history=(),
+        )
+
+        with mock.patch.dict(
+            "channel_runtime.codex_orchestrator.os.environ",
+            {"CHANNEL_CODEX_ADD_DIRS": "relative/path"},
+            clear=True,
+        ), self.assertRaisesRegex(CodexExecError, "paths must be absolute"):
+            _default_codex_invoke(request, timeout_s=3.0)
+
+    def test_invokes_codex_with_configured_model_override(self) -> None:
+        request = CodexInvocationRequest(
+            session_id="telegram:100",
+            chat_id="100",
+            user_id="u-1",
+            text="hello",
+            update_id="1",
+            message_id="m-1",
+            conversation_history=(),
+        )
+
+        with mock.patch.dict(
+            "channel_runtime.codex_orchestrator.os.environ",
+            {"CHANNEL_CODEX_MODEL": "gpt-5.5"},
+            clear=True,
+        ), mock.patch("channel_runtime.codex_orchestrator.subprocess.run") as run_mock:
+            run_mock.return_value = mock.Mock(returncode=0, stdout="ok\n", stderr="")
+            _default_codex_invoke(request, timeout_s=3.0)
+
+        args = run_mock.call_args.args[0]
+        self.assertEqual(args[2:4], ["--model", "gpt-5.5"])
+
+    def test_falls_back_to_preferred_model_then_configured_default(self) -> None:
+        request = CodexInvocationRequest(
+            session_id="telegram:100",
+            chat_id="100",
+            user_id="u-1",
+            text="hello",
+            update_id="1",
+            message_id="m-1",
+            conversation_history=(),
+        )
+
+        with mock.patch.dict(
+            "channel_runtime.codex_orchestrator.os.environ", {}, clear=True
+        ), mock.patch("channel_runtime.codex_orchestrator.subprocess.run") as run_mock:
+            run_mock.side_effect = [
+                mock.Mock(returncode=1, stdout="", stderr="model unavailable"),
+                mock.Mock(returncode=1, stdout="", stderr="fallback unavailable"),
+                mock.Mock(returncode=0, stdout="ok\n", stderr=""),
+            ]
+            self.assertEqual(_default_codex_invoke(request, timeout_s=3.0), "ok")
+
+        calls = run_mock.call_args_list
+        self.assertEqual(calls[0].args[0][2:4], ["--model", "gpt-5.6-luna"])
+        self.assertEqual(calls[1].args[0][2:4], ["--model", "gpt-5.4"])
+        self.assertNotIn("--model", calls[2].args[0])
 
     def test_invokes_codex_with_config_default_sandbox_and_search_opt_in(self) -> None:
         request = CodexInvocationRequest(

@@ -155,6 +155,38 @@ class TelegramApiClient:
             )
         return result
 
+    def send_photo(
+        self,
+        *,
+        chat_id: str | int,
+        photo_bytes: bytes,
+        filename: str = "trade.png",
+        caption: str | None = None,
+        reply_to_message_id: str | int | None = None,
+        reply_markup: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"chat_id": chat_id}
+        if caption is not None:
+            payload["caption"] = caption
+        if reply_to_message_id is not None:
+            payload["reply_to_message_id"] = reply_to_message_id
+        if reply_markup is not None:
+            payload["reply_markup"] = json.dumps(reply_markup, separators=(",", ":"))
+        result = self._request_multipart(
+            "sendPhoto", payload, file_field="photo", filename=filename,
+            content_type="image/png", file_bytes=photo_bytes,
+        )
+        if not isinstance(result, dict):
+            raise TelegramApiError(
+                operation="sendPhoto", kind="invalid-result-shape", transient=False,
+                description="result must be an object",
+            )
+        return result
+
+    def answer_callback_query(self, *, callback_query_id: str) -> dict[str, Any]:
+        result = self._request("answerCallbackQuery", {"callback_query_id": callback_query_id})
+        return result if isinstance(result, dict) else {}
+
     def get_file(self, *, file_id: str) -> dict[str, Any]:
         payload = {"file_id": str(file_id).strip()}
         result = self._request("getFile", payload)
